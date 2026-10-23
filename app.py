@@ -56,7 +56,11 @@ def conn():
 
 def client():
     if app.state.client is None:
-        app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(900, connect=10))
+        # keepalive_expiry=2: the model server (uvicorn) drops an idle connection after 5 s, the same as httpx's
+        # default, so through the tunnel a request sent ~5 s after the last one landed on a closing connection and
+        # failed (measured: 8/33 at 4.8-5.0 s pauses with the default, 0/33 with 2 s).
+        app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(900, connect=10),
+                                             limits=httpx.Limits(keepalive_expiry=2))
     return app.state.client
 
 
