@@ -1,0 +1,5 @@
+{
+  "starter": {"five_hour": 100000, "weekly": 500000},
+  "power":   {"five_hour": 350000, "weekly": 1800000},
+  "max":     {"five_hour": 1000000, "weekly": 5000000}
+}
