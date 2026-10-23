@@ -109,14 +109,16 @@ def refused(reason, resets):
 
 
 # Sherlock's only window onto the live web. The model can't reach the internet itself; this is the piece that does,
-# server-side, so the chat's web_search tool has something to call. Keyless DuckDuckGo by default; set
-# REDBEARD_BRAVE_KEY to swap to Brave (reliable, privacy-focused) with no code change. Only the query leaves the box.
+# server-side, so the chat's web_search tool has something to call. Only the query leaves the box. In order:
+# REDBEARD_BRAVE_KEY set -> Brave's paid API; REDBEARD_SEARXNG set -> our own SearXNG (asks many engines at once and
+# merges them, free); and keyless DuckDuckGo whenever SearXNG is unset, down or finds nothing.
 SEARCH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 BRAVE_KEY = os.environ.get("REDBEARD_BRAVE_KEY", "")
+SEARXNG = os.environ.get("REDBEARD_SEARXNG", "")
 
 
 async def run_search(query: str, limit: int = 5):
-    """Return [{title, url, snippet}] for a query. Brave when a key is set, else scrape DuckDuckGo's HTML endpoint."""
+    """Return [{title, url, snippet}] for a query (see the order above)."""
     query = " ".join(query.split())[:400]
     if not query:
         return []
@@ -125,6 +127,16 @@ async def run_search(query: str, limit: int = 5):
                                headers={"X-Subscription-Token": BRAVE_KEY, "Accept": "application/json"}, timeout=12)
         items = ((r.json().get("web") or {}).get("results") or []) if r.status_code == 200 else []
         return [{"title": i.get("title", ""), "url": i.get("url", ""), "snippet": i.get("description", "")} for i in items[:limit]]
+    if SEARXNG:
+        try:
+            r = await client().get(SEARXNG.rstrip("/") + "/search", params={"q": query, "format": "json"}, timeout=12)
+            items = (r.json().get("results") or []) if r.status_code == 200 else []
+            out = [{"title": i.get("title", ""), "url": i["url"], "snippet": i.get("content", "")}
+                   for i in items if i.get("url", "").startswith(("http://", "https://"))][:limit]
+            if out:
+                return out
+        except (httpx.HTTPError, ValueError, AttributeError):
+            pass  # fall through to DuckDuckGo
     r = await client().get("https://html.duckduckgo.com/html/", params={"q": query}, headers={"User-Agent": SEARCH_UA}, timeout=12)
     strip = lambda s: htmllib.unescape(re.sub("<[^>]+>", "", s)).strip()
     out = []

@@ -36,7 +36,7 @@ appears in the hourly totals.
     pip install -r requirements.txt
     cp plans.example.json plans.json      # then set your real per-plan limits (plans.json is gitignored)
     python -m uvicorn app:app --host 127.0.0.1 --port 8041 --no-access-log
-    python test_gateway.py                # 12 checks, fully offline
+    python test_gateway.py                # 13 checks, fully offline
 
 ## Configuration
 
@@ -50,7 +50,9 @@ Everything secret or environment-specific is read from the environment; **there 
 - `REDBEARD_STATS_DB` — path to the hourly-totals file.
 - `REDBEARD_ADMIN_HASH` — SHA-256 of the admin key (unset: the back office answers 404); `REDBEARD_GPU_HOURLY` —
   the GPU box's price an hour, for the back office's cost estimate.
-- `REDBEARD_BRAVE_KEY` — optional: web search through Brave's API instead of DuckDuckGo's HTML page.
+- `REDBEARD_SEARXNG` — optional: a SearXNG instance (self-hosted metasearch) to search with; DuckDuckGo's HTML page
+  is the fallback when it is unset, down or finds nothing.
+- `REDBEARD_BRAVE_KEY` — optional: web search through Brave's paid API instead (takes precedence when set).
 
 ## License
 

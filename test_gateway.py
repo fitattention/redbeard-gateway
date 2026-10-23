@@ -316,6 +316,42 @@ def test_stats():
     asyncio.run(run())
 
 
+def test_search_order():
+    """Web search: our SearXNG first (merged engines); DuckDuckGo when SearXNG is unset, down or finds nothing; only
+    http(s) links pass (they become clickable sources in the chat)."""
+    ddg_html = ('<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fddg.example%2Fp&amp;rut=x">DDG hit</a>'
+                '<a class="result__snippet" href="x">from ddg</a>')
+    mode = {"searx": "ok"}
+
+    def handler(request):
+        if request.url.host == "searx.local":
+            if mode["searx"] == "down":
+                raise httpx.ConnectError("searxng down")
+            assert request.url.params["format"] == "json" and request.url.params["q"] == "two words"
+            results = [] if mode["searx"] == "empty" else [
+                {"title": "Merged", "url": "https://merged.example/a", "content": "seen by google and brave"},
+                {"title": "Bad", "url": "javascript:alert(1)", "content": "x"}]
+            return httpx.Response(200, json={"results": results})
+        if request.url.host == "html.duckduckgo.com":
+            return httpx.Response(200, text=ddg_html)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    real = (gateway.app.state.client, gateway.SEARXNG, gateway.BRAVE_KEY)
+    gateway.app.state.client, gateway.BRAVE_KEY = httpx.AsyncClient(transport=httpx.MockTransport(handler)), ""
+    try:
+        run = lambda: asyncio.run(gateway.run_search("  two \n words "))
+        gateway.SEARXNG = "http://searx.local:18888/"
+        assert run() == [{"title": "Merged", "url": "https://merged.example/a", "snippet": "seen by google and brave"}]
+        for m in ("empty", "down"):
+            mode["searx"] = m
+            assert run() == [{"title": "DDG hit", "url": "https://ddg.example/p", "snippet": "from ddg"}], m
+        gateway.SEARXNG, mode["searx"] = "", "ok"                    # not configured: DuckDuckGo as before
+        assert run()[0]["title"] == "DDG hit"
+        assert asyncio.run(gateway.run_search("   ")) == []
+    finally:
+        gateway.app.state.client, gateway.SEARXNG, gateway.BRAVE_KEY = real
+
+
 def test_uptime():
     """The /v1/uptime feed: 90 slots, today reflects the samples, days with no sample read as null (never faked up)."""
     import sqlite3
