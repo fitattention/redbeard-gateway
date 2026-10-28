@@ -3,6 +3,9 @@
 # the virtualenv, and the local PowerShell helpers.
 /*
 !/app.py
+!/images.py
+!/test_images.py
+!/test_reader.py
 !/meter.py
 !/store.py
 !/admin.py

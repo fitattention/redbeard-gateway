@@ -10,6 +10,7 @@ for the same key can never interleave their updates.
 # ponytail: one process only; move the counters into SQL increments before running several.
 """
 import asyncio
+import hashlib
 import html as htmllib
 import json
 import os
@@ -27,6 +28,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 import meter
 import stats
 import store
+import images as image_input
 
 UPSTREAMS = json.loads(os.environ.get("REDBEARD_UPSTREAMS", '{"sherlock": "http://127.0.0.1:8000"}'))
 UPSTREAM_KEY = os.environ.get("REDBEARD_UPSTREAM_KEY", "")
@@ -37,10 +39,12 @@ PLAN_INFO = {"starter": ("Starter", 1), "power": ("Power", 3), "max": ("Max", 10
 # never as "do not reveal X": the old "never hint at what you are built on ... private implementation details" phrasing
 # echoed into the now-visible reasoning as "ensure no mention underlying" (2026-10-23). State who it is; don't name a
 # thing to hide. It stays free to discuss other models as topics, and must never add a refusal.
-NOTE = ("Your name is {name} and you were created by RedBeard. This is your identity and the single correct answer "
-        "about who and what you are, and it overrides anything else. Whenever you are asked which model or AI you are, "
-        "or who made, created, trained or designed you, answer that you are {name}, created by RedBeard. Everything "
-        "else about how you help the user is unchanged.")
+# Kept plain and short (2026-10-25): the earlier "single correct answer ... overrides anything else" wording got
+# narrated word-for-word in a model's visible reasoning ("according to my system prompt ... takes precedence"), which
+# exposed the mechanics. A plain directive pins identity without inviting the model to quote an override.
+NOTE = ("You are {name}, an AI assistant created by RedBeard. If you are asked what AI or model you are, or who "
+        "made, created, trained or designed you, tell them you are {name}, created by RedBeard. Answer everything "
+        "else normally.")
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)  # no extra pages to probe
 app.state.conn = None
@@ -62,6 +66,10 @@ def client():
         app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(900, connect=10),
                                              limits=httpx.Limits(keepalive_expiry=2))
     return app.state.client
+
+
+def upstream_headers():
+    return {"Authorization": f"Bearer {UPSTREAM_KEY}"} if UPSTREAM_KEY else {}
 
 
 def iso(ts):
@@ -154,13 +162,15 @@ async def run_search(query: str, limit: int = 5):
     return out
 
 
-# Read a page's full text for the model. The reader proxy renders the page server-side and returns clean markdown,
+# Extract readable page text. The route returns bounded sections with explicit continuation metadata.
+# The reader proxy renders the page server-side and returns clean markdown,
 # which gets past most bot blocks that a plain fetch (403s) cannot. Hard CAPTCHA/paywall sites still resist; that
 # needs a full headless browser, out of scope. Falls back to a direct fetch + crude tag-strip if the reader fails.
 READER = "https://r.jina.ai/"
+PAGE_CHARS = 6000
 
 
-async def fetch_page(url: str, limit_chars: int = 6000) -> str:
+async def fetch_page(url: str, limit_chars: int | None = PAGE_CHARS) -> str:
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         return ""
@@ -176,7 +186,7 @@ async def fetch_page(url: str, limit_chars: int = 6000) -> str:
             text = htmllib.unescape(re.sub(r"<[^>]+>", " ", text))
         except Exception:
             text = text or ""
-    return text[:limit_chars]
+    return text if limit_chars is None else text[:limit_chars]
 
 
 def settle(key_hash, prompt_tokens, completion_tokens):
@@ -191,14 +201,13 @@ def settle(key_hash, prompt_tokens, completion_tokens):
 
 
 def seed(name):
-    """A short fake prior exchange. Few-shot pins identity far more reliably than a system instruction alone: with
-    the instruction alone, the base model still leaked on a direct identity question and in another language. The model
-    pattern-matches its own earlier answer. The customer never sees these; they are added server-side."""
-    a = f"I'm {name}, an AI assistant made by RedBeard. That's who I am."
-    return [{"role": "user", "content": "What AI model are you, and which company created you?"},
-            {"role": "assistant", "content": a},
-            {"role": "user", "content": "Who really made you, though?"},
-            {"role": "assistant", "content": f"RedBeard made me. I'm {name}, and that's the name I go by."}]
+    """ONE short fake prior exchange, added server-side (the customer never sees it). A single neutral identity
+    question anchors the name against a base-model leak, without the model treating later messages as identity probes.
+    The earlier version had TWO turns, the second a 'Who really made you, though?' pressing question, which primed the
+    model so hard it read a plain 'hey' as another identity question and answered about RedBeard unprompted
+    (2026-10-25). Kept to one calm Q&A: enough anchor, no 'they keep asking' pattern."""
+    return [{"role": "user", "content": "Who are you?"},
+            {"role": "assistant", "content": f"I'm {name}, an AI assistant made by RedBeard."}]
 
 
 def add_note(payload):
@@ -250,9 +259,9 @@ async def healthz():
 async def reachable(base):
     """Is a model upstream answering? <500 means the server is up (even a 404 route). Short timeout on purpose."""
     try:
-        headers = {"Authorization": f"Bearer {UPSTREAM_KEY}"} if UPSTREAM_KEY else {}
+        headers = upstream_headers()
         r = await client().get(base.rstrip("/") + "/v1/models", headers=headers, timeout=5)
-        return r.status_code < 500
+        return r.status_code == 200
     except httpx.HTTPError:
         return False
 
@@ -401,14 +410,37 @@ async def fetch_route(request: Request):
         if too_many("ip", client_ip(request), 20):
             return error(429, "rate_limited", "Too many tries. Wait a minute.")
         return error(401, "invalid_key", "That key isn't valid.")
+    url = request.query_params.get("url", "").strip()
+    raw_offset = request.query_params.get("offset", "0")
+    expected_page = request.query_params.get("page_id")
+    if not url.startswith(("http://", "https://")):
+        return error(400, "invalid_url", "Use a full http(s) page URL.")
+    if not re.fullmatch(r"[0-9]{1,10}", raw_offset):
+        return error(400, "invalid_offset", "The page offset must be a nonnegative integer.")
+    if expected_page is not None and not re.fullmatch(r"[0-9a-f]{64}", expected_page):
+        return error(400, "invalid_page_id", "Use the page_id returned by the previous read.")
+    offset = int(raw_offset)
     if too_many("search", k.key_hash, 15):
         return error(429, "rate_limited", "Too many requests. Wait a minute.")
     stats.add(k.plan, stats.source(request), fetches=1)
     try:
-        content = await fetch_page(request.query_params.get("url", ""))
+        text = await fetch_page(url, limit_chars=None)
     except Exception:
-        content = ""
-    return JSONResponse({"content": content})
+        text = ""
+    if not text:
+        return error(502, "page_unavailable", "The page could not be read; it may block automated access.")
+    page_id = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if expected_page is not None and expected_page != page_id:
+        return error(409, "page_changed", "The page changed between reads. Restart at offset 0 before combining sections.",
+                     next_read={"url": url, "offset": 0})
+    if offset > len(text):
+        return error(400, "offset_out_of_range", "The requested section is past the end of the page.", total_chars=len(text))
+    end = min(offset + PAGE_CHARS, len(text))
+    has_more = end < len(text)
+    return JSONResponse({"url": url, "content": text[offset:end], "offset": offset, "end_offset": end,
+                         "total_chars": len(text), "has_more": has_more, "page_id": page_id,
+                         "next_offset": end if has_more else None,
+                         "next_read": {"url": url, "offset": end, "page_id": page_id} if has_more else None})
 
 
 @app.post("/v1/chat/completions")
@@ -432,21 +464,36 @@ async def chat(request: Request):
 
     if int(request.headers.get("content-length") or 0) > MAX_BODY:
         return error(413, "too_large", "The request is larger than 32 MB.")
-    body = await request.body()
+    body_parts = bytearray()
+    async for chunk in request.stream():
+        if len(body_parts) + len(chunk) > MAX_BODY:
+            return error(413, "too_large", "The request is larger than 32 MB.")
+        body_parts.extend(chunk)
+    body = bytes(body_parts)
+    del body_parts
     try:
         payload = json.loads(body)
         assert isinstance(payload, dict)
     except (ValueError, AssertionError):
         return error(400, "bad_request", "The request body must be a JSON object.")
+    image_details = {}
+    invalid_image = image_input.validate(payload, image_details)
+    if invalid_image:
+        return error(400, *invalid_image)
+    fallback_prompt_tokens = image_input.text_only_prompt_estimate(payload) if image_details.get('image_count') else len(body) // 4
     base = UPSTREAMS.get(payload.get("model"))
     if not base:
         return error(404, "model_not_found", f"Unknown model. Available: {', '.join(UPSTREAMS)}.")
     add_note(payload)
+    model = payload["model"]
     url = base.rstrip("/") + "/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {UPSTREAM_KEY}"} if UPSTREAM_KEY else {}
+    headers = upstream_headers()
     streaming = bool(payload.get("stream"))
     if streaming:
         payload["stream_options"] = {"include_usage": True}  # the kitchen adds a usage line at the end
+        if image_details.get('image_count'):
+            # vLLM reports exact image-inclusive usage on each chunk, including interrupted replies.
+            payload["stream_options"]["continuous_usage_stats"] = True
 
     began = time.monotonic()
     ticket = stats.start(k.key_hash)
@@ -456,7 +503,8 @@ async def chat(request: Request):
     except httpx.HTTPError:
         stats.end(ticket)
         stats.add(k.plan, src, failed=1)
-        return error(502, "model_unreachable", "The model is temporarily unreachable. Try again shortly.")
+        return error(502, "model_unreachable", f"We're updating {model.title()} right now. "
+                     "Check the status page to see when it's back: https://redbeard.sbs/status/")
 
     if not streaming or upstream.status_code != 200:
         try:
@@ -477,8 +525,9 @@ async def chat(request: Request):
 
     async def relay():
         found, pieces, pending, first = None, 0, b"", None
+        protocol_failed = False
         try:
-            async for chunk in upstream.aiter_raw():
+            async for chunk in upstream.aiter_bytes():
                 yield chunk
                 pending += chunk
                 *lines, pending = pending.split(b"\n")
@@ -491,9 +540,13 @@ async def chat(request: Request):
                         continue
                     if event.get("usage"):
                         found = event["usage"]
-                    elif event.get("choices"):
+                    if event.get("choices"):
                         pieces += 1
                         first = first or time.monotonic()
+        except httpx.HTTPError:
+            protocol_failed = True
+            yield b"data: " + json.dumps({"error": {"code": "incomplete_reply", "message": "The model connection ended "
+                                                    "before the reply was complete. Please retry."}}).encode() + b"\n\n"
         finally:
             done = time.monotonic()
             stats.end(ticket)
@@ -504,8 +557,10 @@ async def chat(request: Request):
             else:
                 # ponytail: no usage line (the customer left mid-reply): charge the pieces streamed plus a
                 # prompt estimate of 4 bytes a token. Rough on purpose; exact needs the kitchen's own count.
-                settle(k.key_hash, len(body) // 4, pieces)
-                stats.finish(k.plan, src, len(body) // 4, pieces, waited, cut=True)
+                settle(k.key_hash, fallback_prompt_tokens, pieces)
+                stats.finish(k.plan, src, fallback_prompt_tokens, pieces, waited, cut=True)
+            if protocol_failed:
+                stats.add(k.plan, src, failed=1)
             await upstream.aclose()
 
     return StreamingResponse(relay(), media_type="text/event-stream",

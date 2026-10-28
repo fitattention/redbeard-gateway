@@ -17,7 +17,7 @@ SPEED_BAR = 40          # tokens a second per reply: the owner's line for "fast"
 MIN_FOR_SPEED = 20      # replies shorter than this give no fair speed reading
 STALE = 900             # a reply open longer than the gateway's read timeout is gone, whatever happened to it
 COUNTS = ("requests", "prompt_tokens", "completion_tokens", "gen_tokens", "gen_ms", "timed", "wait_ms", "waited", "slow",
-          "cut", "failed", "limit_5h", "limit_week", "expired", "empty", "searches", "fetches")
+          "cut", "failed", "limit_5h", "limit_week", "expired", "empty", "searches", "fetches", "upstream_micros")
 REFUSAL = {"five_hour": "limit_5h", "weekly": "limit_week", "expired": "expired", "balance": "empty"}
 
 _db = None
@@ -29,6 +29,9 @@ def connect(path):
     c.execute("CREATE TABLE IF NOT EXISTS hourly (hour INTEGER NOT NULL, plan TEXT NOT NULL, source TEXT NOT NULL, "
               + ", ".join(f"{n} INTEGER NOT NULL DEFAULT 0" for n in COUNTS) + ", PRIMARY KEY (hour, plan, source))")
     c.execute("CREATE TABLE IF NOT EXISTS load (hour INTEGER PRIMARY KEY, at_once INTEGER NOT NULL, keys INTEGER NOT NULL)")
+    columns = {row[1] for row in c.execute("PRAGMA table_info(hourly)")}
+    if "upstream_micros" not in columns:
+        c.execute("ALTER TABLE hourly ADD COLUMN upstream_micros INTEGER NOT NULL DEFAULT 0")
     return c
 
 

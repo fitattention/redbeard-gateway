@@ -31,6 +31,12 @@ import store
 router = APIRouter()
 ADMIN_HASH = os.environ.get("REDBEARD_ADMIN_HASH", "").strip().lower()
 GPU_HOURLY = float(os.environ.get("REDBEARD_GPU_HOURLY") or 0)
+GPU_BILLING_START = float(os.environ.get("REDBEARD_GPU_BILLING_START") or 0)
+GPU_RUNNING_SINCE = float(os.environ.get("REDBEARD_GPU_RUNNING_SINCE") or 0)
+GPU_STORAGE_HOURLY = float(os.environ.get("REDBEARD_GPU_STORAGE_HOURLY") or 0)
+LEGACY_GPU_HOURLY = float(os.environ.get("REDBEARD_LEGACY_GPU_HOURLY") or 0)
+API_MODE = os.environ.get("REDBEARD_INFERENCE_MODE") == "api"
+RETIRED_COMPONENT = os.environ.get("REDBEARD_RETIRED_COMPONENT", "sherlock-gpu")
 COMMANDS = ("new", "extend", "topup", "revoke", "credit")
 PLAN_BY_PRICE = {cents / 100: plan for plan, cents in checkout.PRICES.items()}  # sales made before metadata: guessed
 RPC = {"bnb": "https://bsc-rpc.publicnode.com", "matic": "https://polygon-bor-rpc.publicnode.com",
@@ -157,15 +163,29 @@ def keys(conn, now):
 
 def gpu_hours(since):
     """Hours the model answered, from the /status recorder's five-minute samples (an estimate of box time)."""
+    if GPU_BILLING_START:
+        return round(max(0, time.time() - max(since, GPU_RUNNING_SINCE or time.time())) / 3600, 1)
     g = checkout.gw()
     day = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%d")
     names = list(g.UPSTREAMS)
     try:
         up = g.uptime_db().execute("SELECT COALESCE(SUM(up), 0) FROM uptime WHERE day >= ? AND component = ?",
-                                   (day, names[0] if names else "")).fetchone()[0]
+                                   (day, RETIRED_COMPONENT if API_MODE else names[0] if names else "")).fetchone()[0]
     except Exception:
         return None
     return round(up * 300 / 3600, 1)
+
+
+def retired_gpu_hours(since):
+    """Read frozen pre-API GPU samples without reclassifying API uptime as GPU time."""
+    day = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%d")
+    try:
+        up = checkout.gw().uptime_db().execute(
+            "SELECT COALESCE(SUM(up), 0) FROM uptime WHERE day >= ? AND component = ?",
+            (day, RETIRED_COMPONENT)).fetchone()[0]
+        return up * 300 / 3600
+    except Exception:
+        return None
 
 
 def summary(sales, key_rows, hourly, hours, now):
@@ -186,9 +206,26 @@ def summary(sales, key_rows, hourly, hours, now):
                                                             and k["days_left"] <= 7 for k in key_rows),
                    "ended": sum(k["status"] == "ended" for k in key_rows),
                    "payg_owed_usd": round(sum(k["balance_usd"] or 0 for k in key_rows if k["status"] == "active"), 2)}
-    cost = round(hours * GPU_HOURLY, 2) if hours is not None and GPU_HOURLY else None
+    legacy = round(hours * GPU_HOURLY, 2) if hours is not None and GPU_HOURLY else None
+    api_cost = sum(r.get("upstream_micros", 0) for r in hourly) / 1e6 if API_MODE else 0
+    cost = round((legacy or 0) + api_cost, 2) if API_MODE else legacy
+    current_gpu = None
+    if GPU_BILLING_START:
+        # Storage bills during image loading; GPU time starts when the instance runs.
+        storage_hours = max(0, now - max(month, GPU_BILLING_START)) / 3600
+        running_hours = max(0, now - max(month, GPU_RUNNING_SINCE or now)) / 3600
+        current_gpu = storage_hours * GPU_STORAGE_HOURLY + running_hours * max(0, GPU_HOURLY - GPU_STORAGE_HOURLY)
+        frozen_hours = retired_gpu_hours(month)
+        legacy = round(frozen_hours * LEGACY_GPU_HOURLY, 2) if frozen_hours is not None else None
+        api_cost = sum(r.get("upstream_micros", 0) for r in hourly) / 1e6
+        cost = round(current_gpu + (legacy or 0) + api_cost, 2)
     out["gpu"] = {"hours_30d": hours, "hourly": GPU_HOURLY or None, "cost_30d": cost,
                   "margin_30d": round(out["revenue"]["30d"] - cost, 2) if out["revenue"] and cost is not None else None}
+    if API_MODE:
+        out["gpu"].update(mode="api", api_cost_30d=round(api_cost, 6), legacy_gpu_cost_30d=legacy)
+    elif GPU_BILLING_START:
+        out["gpu"].update(mode="gpu", api_cost_30d=round(api_cost, 6), legacy_gpu_cost_30d=legacy,
+                          current_gpu_cost_30d=round(current_gpu, 6))
     used = Counter()
     for r in hourly:
         used[r["plan"]] += meter.counted(r["prompt_tokens"], r["completion_tokens"])
@@ -196,7 +233,10 @@ def summary(sales, key_rows, hourly, hours, now):
     out["plans"] = {p: {"active_keys": active[p], "tokens_30d": used[p],
                         "revenue_30d": round(sum(s["usd"] for s in paid if s["plan"] == p and ts(s["paid_at"] or s["created"]) >= month), 2)
                         if sales is not None else None,
-                        "cost_30d": round(cost * used[p] / total, 2) if cost is not None and total else None}
+                        "cost_30d": (round(((legacy or 0) + (current_gpu or 0)) * used[p] / total +
+                                          sum(r.get("upstream_micros", 0) for r in hourly if r["plan"] == p) / 1e6, 2)
+                                     if (API_MODE or GPU_BILLING_START) and total else round(cost * used[p] / total, 2)
+                                     if cost is not None and total else None)}
                     for p in store.PLAN_IDS}
     return out
 

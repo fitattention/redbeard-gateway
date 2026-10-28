@@ -169,7 +169,7 @@ async def run_e2e():
         assert m[0] == {"role": "system", "content": note}                            # note first
         assert m[-1] == {"role": "user", "content": "hi"}                             # real message last, untouched
         assert sum(1 for x in m if x["role"] == "system") == 1                        # exactly one system message
-        assert [x["role"] for x in m] == ["system", "user", "assistant", "user", "assistant", "user"]  # seed between
+        assert [x["role"] for x in m] == ["system", "user", "assistant", "user"]  # one seed exchange between
         assert any("RedBeard" in x["content"] for x in m if x["role"] == "assistant")
         app_sys = {"role": "system", "content": "You are opencode."}
         await gw.post("/v1/chat/completions", json={**ask, "messages": [app_sys, ask["messages"][0]]}, headers=auth)
@@ -246,6 +246,7 @@ async def run_e2e():
         gateway.UPSTREAMS = {"sherlock": "http://127.0.0.1:9"}
         r = await gw.post("/v1/chat/completions", json=ask, headers={"Authorization": f"Bearer {raw6}"})
         assert r.status_code == 502 and r.json()["error"]["code"] == "model_unreachable"
+        assert r.json()["error"]["message"].startswith("We're updating Sherlock") and "redbeard.sbs/status/" in r.json()["error"]["message"]
 
     tables = [t for (t,) in gateway.app.state.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
     assert tables == ["keys", "orders"]                                                # nothing else is kept
@@ -410,6 +411,30 @@ def test_hang_up_mid_reply():
     finally:
         for s in servers:
             s.should_exit = True
+
+
+def test_box_drops_mid_reply():
+    """The model server dies partway through a reply: the customer gets an explicit error, and pays only what came."""
+    class Dies(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
+            raise httpx.ReadError("server gone")
+
+    fresh_gateway()
+    gateway.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, stream=Dies())))
+    raw, h = add_key()
+
+    async def ask():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://gw") as gw:
+            r = await gw.post("/v1/chat/completions", headers={"Authorization": f"Bearer {raw}"},
+                              json={"model": "sherlock", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+            return r.text
+    try:
+        text = asyncio.run(ask())
+        assert '"Hel"' in text and '"incomplete_reply"' in text
+        assert 0 < used(h).fh_used < 100
+    finally:
+        gateway.app.state.client = None
 
 
 fake_bitcart = FastAPI()

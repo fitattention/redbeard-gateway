@@ -37,6 +37,19 @@ appears in the hourly totals.
     cp plans.example.json plans.json      # then set your real per-plan limits (plans.json is gitignored)
     python -m uvicorn app:app --host 127.0.0.1 --port 8041 --no-access-log
     python test_gateway.py                # 13 checks, fully offline
+    python -m unittest test_reader -v      # page sections, continuation and read failures
+
+## Page reading
+
+`GET /v1/fetch?url=...` returns up to 6,000 characters of extracted page text in `content`, plus `offset`,
+`end_offset`, `total_chars`, `has_more`, `next_offset`, `page_id` and `next_read`. When `has_more` is true,
+pass the returned `next_read` fields as query parameters to retrieve the next section. Callers can stop
+as soon as they have the text they need. A result only describes the reader's extracted text.
+
+The page is fetched again for each section; no page cache or content-storage table is added. Send the
+previous `page_id` to detect a changed extraction: a mismatch returns `409 page_changed` with restart
+arguments. Invalid offsets and failed reads return explicit errors. Existing URL-only calls still
+receive their first section in the `content` field.
 
 ## Configuration
 
@@ -44,6 +57,8 @@ Everything secret or environment-specific is read from the environment; **there 
 
 - `REDBEARD_UPSTREAMS` — JSON mapping a model name to its server base URL.
 - `REDBEARD_UPSTREAM_KEY` — bearer token for the model server, if it needs one.
+- `REDBEARD_INFERENCE_MODE=api` — include aggregate API expense estimates in the back office. Only an additional numeric
+  hourly total is recorded. Historical GPU samples are retained under `REDBEARD_RETIRED_COMPONENT`.
 - `REDBEARD_PLANS` (JSON) or a local `plans.json` — the per-plan token windows.
 - `REDBEARD_DB` — path to the SQLite keys file.
 - `BITCART_API`, `BITCART_HOST_HEADER`, `BITCART_TOKEN`, `BITCART_STORE_ID`, `REDBEARD_PUBLIC_BASE` — crypto checkout.
