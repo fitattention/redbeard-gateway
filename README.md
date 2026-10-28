@@ -12,7 +12,8 @@ open so anyone can verify the one promise that matters most: **it never stores y
 - Handles crypto checkout (through a Bitcart instance) and issues or extends keys.
 - Runs web search and page reading for the website chat (`/v1/web_search`, `/v1/fetch`); only the query or the URL
   leaves the server.
-- Serves the owner's back office (`/v1/admin/*`, `backoffice.py`), locked by one admin key kept only as its SHA-256.
+- Serves the owner's back office (`backoffice.py`) at a private path set on the server, locked by one admin key kept
+  only as its SHA-256.
 
 ## What it stores, in full
 
@@ -23,7 +24,8 @@ Two SQLite tables in the keys file (created in `store.py`):
   day old and finished, or a week old if unfinished (so a late payment can still be credited).
 
 And one separate file of hourly totals (`stats.py`, `REDBEARD_STATS_DB`): one row per hour, per plan, per route
-(website chat or API), holding only counts and sums (replies, tokens, seconds, limits reached, searches), plus the
+(website chat or API), holding only counts and sums (replies, tokens, seconds, limits reached, searches, tries while
+the model was offline), plus the
 most replies at once and how many keys were active in that hour, as numbers. No key, no fingerprint, no text; rows
 older than 400 days are deleted.
 
@@ -63,7 +65,8 @@ Everything secret or environment-specific is read from the environment; **there 
 - `REDBEARD_DB` — path to the SQLite keys file.
 - `BITCART_API`, `BITCART_HOST_HEADER`, `BITCART_TOKEN`, `BITCART_STORE_ID`, `REDBEARD_PUBLIC_BASE` — crypto checkout.
 - `REDBEARD_STATS_DB` — path to the hourly-totals file.
-- `REDBEARD_ADMIN_HASH` — SHA-256 of the admin key (unset: the back office answers 404); `REDBEARD_GPU_HOURLY` —
+- `REDBEARD_ADMIN_HASH` — SHA-256 of the admin key, and `REDBEARD_ADMIN_PATH` — the back office's private path segment
+  (either unset: the back office answers 404); `REDBEARD_GPU_HOURLY` —
   the GPU box's price an hour, for the back office's cost estimate.
 - `REDBEARD_SEARXNG` — optional: a SearXNG instance (self-hosted metasearch) to search with; DuckDuckGo's HTML page
   is the fallback when it is unset, down or finds nothing.

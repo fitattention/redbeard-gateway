@@ -1,12 +1,16 @@
-"""The owner's back office: GET /v1/admin/overview (everything on one page) and POST /v1/admin/run (admin.py's own
-commands, so the page and the server command can never disagree).
+"""The owner's back office: GET /v1/<path>/overview (everything on one page) and POST /v1/<path>/run (admin.py's own
+commands, so the page and the server command can never disagree). <path> is REDBEARD_ADMIN_PATH, a private value
+kept only in the server's environment; any other path answers 404 like an address that doesn't exist, and while it
+is unset the back office is off.
 
 One admin key, kept only as its SHA-256 in REDBEARD_ADMIN_HASH; while that is unset every admin route answers 404.
 It reads what already exists and keeps the halves apart as they are on disk: sales come from Bitcart (the gateway's
 own invoice token, nothing new), keys from the key table, usage from stats.py's anonymous hourly totals; a sale is
 never joined to a key. Wallet balances are read from the public chains, so this server never holds Bitcart's wallet
 access (which could change the address customers pay into). Something it can't read shows as null, never as 0.
-Settings: REDBEARD_ADMIN_HASH, REDBEARD_GPU_HOURLY (dollars an hour for the GPU box: the cost estimate).
+Settings: REDBEARD_ADMIN_HASH, REDBEARD_ADMIN_PATH, REDBEARD_GPU_HOURLY (dollars an hour for the GPU box: the estimate
+used when the real bill can't be read). The real GPU bill comes from an optional private module, gpu_bill, kept out
+of this public code; it holds only the owner's own costs, never anything about customers.
 """
 import asyncio
 import hashlib
@@ -28,15 +32,15 @@ import meter
 import stats
 import store
 
+try:
+    import gpu_bill  # private: reads the GPU provider's bill with a read-only key (not part of the public code)
+except ImportError:
+    gpu_bill = None
+
 router = APIRouter()
 ADMIN_HASH = os.environ.get("REDBEARD_ADMIN_HASH", "").strip().lower()
-GPU_HOURLY = float(os.environ.get("REDBEARD_GPU_HOURLY") or 0)
-GPU_BILLING_START = float(os.environ.get("REDBEARD_GPU_BILLING_START") or 0)
-GPU_RUNNING_SINCE = float(os.environ.get("REDBEARD_GPU_RUNNING_SINCE") or 0)
-GPU_STORAGE_HOURLY = float(os.environ.get("REDBEARD_GPU_STORAGE_HOURLY") or 0)
-LEGACY_GPU_HOURLY = float(os.environ.get("REDBEARD_LEGACY_GPU_HOURLY") or 0)
-API_MODE = os.environ.get("REDBEARD_INFERENCE_MODE") == "api"
-RETIRED_COMPONENT = os.environ.get("REDBEARD_RETIRED_COMPONENT", "sherlock-gpu")
+ADMIN_PATH = os.environ.get("REDBEARD_ADMIN_PATH", "").strip()  # unset: off, never a guessable default
+GPU_HOURLY = float(os.environ.get("REDBEARD_GPU_HOURLY") or 0)  # only for the estimate, when the bill can't be read
 COMMANDS = ("new", "extend", "topup", "revoke", "credit")
 PLAN_BY_PRICE = {cents / 100: plan for plan, cents in checkout.PRICES.items()}  # sales made before metadata: guessed
 RPC = {"bnb": "https://bsc-rpc.publicnode.com", "matic": "https://polygon-bor-rpc.publicnode.com",
@@ -46,10 +50,10 @@ DAY = 86400
 _wallets = (0.0, [])  # (when read, rows): public chains are asked at most every two minutes
 
 
-def gate(request):
-    """None for the holder of the admin key, else the answer to send."""
+def gate(request, door):
+    """None for the holder of the admin key at the private path, else the answer to send."""
     g = checkout.gw()
-    if not ADMIN_HASH:
+    if not ADMIN_HASH or not hmac.compare_digest(door.encode(), ADMIN_PATH.encode()):  # unset path never matches
         return JSONResponse({"detail": "Not Found"}, status_code=404)
     if g.too_many("admin", g.client_ip(request), 30):
         return g.error(429, "rate_limited", "Too many requests. Wait a minute.")
@@ -162,33 +166,21 @@ def keys(conn, now):
 
 
 def gpu_hours(since):
-    """Hours the model answered, from the /status recorder's five-minute samples (an estimate of box time)."""
-    if GPU_BILLING_START:
-        return round(max(0, time.time() - max(since, GPU_RUNNING_SINCE or time.time())) / 3600, 1)
+    """Hours the model answered, from the /status recorder's five-minute samples. Only hours a server really answered
+    count; a night with no server counts nothing. Runs a little LOW against the bill: the provider charges a server
+    from the moment it is rented, setup included."""
     g = checkout.gw()
     day = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%d")
     names = list(g.UPSTREAMS)
     try:
         up = g.uptime_db().execute("SELECT COALESCE(SUM(up), 0) FROM uptime WHERE day >= ? AND component = ?",
-                                   (day, RETIRED_COMPONENT if API_MODE else names[0] if names else "")).fetchone()[0]
+                                   (day, names[0] if names else "")).fetchone()[0]
     except Exception:
         return None
     return round(up * 300 / 3600, 1)
 
 
-def retired_gpu_hours(since):
-    """Read frozen pre-API GPU samples without reclassifying API uptime as GPU time."""
-    day = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%d")
-    try:
-        up = checkout.gw().uptime_db().execute(
-            "SELECT COALESCE(SUM(up), 0) FROM uptime WHERE day >= ? AND component = ?",
-            (day, RETIRED_COMPONENT)).fetchone()[0]
-        return up * 300 / 3600
-    except Exception:
-        return None
-
-
-def summary(sales, key_rows, hourly, hours, now):
+def summary(sales, key_rows, hourly, hours, now, spent=None):
     month = now - 30 * DAY
     out = {"revenue": None, "funnel": None}
     paid = [s for s in sales or [] if s["status"] == "complete"]
@@ -206,26 +198,15 @@ def summary(sales, key_rows, hourly, hours, now):
                                                             and k["days_left"] <= 7 for k in key_rows),
                    "ended": sum(k["status"] == "ended" for k in key_rows),
                    "payg_owed_usd": round(sum(k["balance_usd"] or 0 for k in key_rows if k["status"] == "active"), 2)}
-    legacy = round(hours * GPU_HOURLY, 2) if hours is not None and GPU_HOURLY else None
-    api_cost = sum(r.get("upstream_micros", 0) for r in hourly) / 1e6 if API_MODE else 0
-    cost = round((legacy or 0) + api_cost, 2) if API_MODE else legacy
-    current_gpu = None
-    if GPU_BILLING_START:
-        # Storage bills during image loading; GPU time starts when the instance runs.
-        storage_hours = max(0, now - max(month, GPU_BILLING_START)) / 3600
-        running_hours = max(0, now - max(month, GPU_RUNNING_SINCE or now)) / 3600
-        current_gpu = storage_hours * GPU_STORAGE_HOURLY + running_hours * max(0, GPU_HOURLY - GPU_STORAGE_HOURLY)
-        frozen_hours = retired_gpu_hours(month)
-        legacy = round(frozen_hours * LEGACY_GPU_HOURLY, 2) if frozen_hours is not None else None
-        api_cost = sum(r.get("upstream_micros", 0) for r in hourly) / 1e6
-        cost = round(current_gpu + (legacy or 0) + api_cost, 2)
-    out["gpu"] = {"hours_30d": hours, "hourly": GPU_HOURLY or None, "cost_30d": cost,
+    estimate = round(hours * GPU_HOURLY, 2) if hours is not None and GPU_HOURLY else None
+    outside = round(sum(r.get("upstream_micros", 0) for r in hourly) / 1e6, 2)  # past outside-AI bills, before 2026-10-28
+    gpu = spent if spent is not None else estimate  # the real GPU bill when it can be read
+    cost = round(gpu + outside, 2) if gpu is not None else None
+    out["gpu"] = {"source": "bill" if spent is not None else "estimate", "hours_30d": hours, "hourly": GPU_HOURLY or None,
+                  "estimate_30d": estimate, "billed_30d": spent, "outside_ai_30d": outside, "cost_30d": cost,
                   "margin_30d": round(out["revenue"]["30d"] - cost, 2) if out["revenue"] and cost is not None else None}
-    if API_MODE:
-        out["gpu"].update(mode="api", api_cost_30d=round(api_cost, 6), legacy_gpu_cost_30d=legacy)
-    elif GPU_BILLING_START:
-        out["gpu"].update(mode="gpu", api_cost_30d=round(api_cost, 6), legacy_gpu_cost_30d=legacy,
-                          current_gpu_cost_30d=round(current_gpu, 6))
+    out["offline"] = {name: sum(r.get("offline", 0) for r in hourly if r["hour"] >= now - days * DAY)
+                      for name, days in (("24h", 1), ("7d", 7), ("30d", 30))}
     used = Counter()
     for r in hourly:
         used[r["plan"]] += meter.counted(r["prompt_tokens"], r["completion_tokens"])
@@ -233,17 +214,14 @@ def summary(sales, key_rows, hourly, hours, now):
     out["plans"] = {p: {"active_keys": active[p], "tokens_30d": used[p],
                         "revenue_30d": round(sum(s["usd"] for s in paid if s["plan"] == p and ts(s["paid_at"] or s["created"]) >= month), 2)
                         if sales is not None else None,
-                        "cost_30d": (round(((legacy or 0) + (current_gpu or 0)) * used[p] / total +
-                                          sum(r.get("upstream_micros", 0) for r in hourly if r["plan"] == p) / 1e6, 2)
-                                     if (API_MODE or GPU_BILLING_START) and total else round(cost * used[p] / total, 2)
-                                     if cost is not None and total else None)}
+                        "cost_30d": round(cost * used[p] / total, 2) if cost is not None and total else None}
                     for p in store.PLAN_IDS}
     return out
 
 
-@router.get("/v1/admin/overview")
-async def overview(request: Request):
-    refused = gate(request)
+@router.get("/v1/{door}/overview")
+async def overview(door: str, request: Request):
+    refused = gate(request, door)
     if refused is not None:
         return refused
     g, now = checkout.gw(), int(time.time())
@@ -266,20 +244,23 @@ async def overview(request: Request):
     month = now - 30 * DAY
     hourly, load = stats.rows(stats.hour_of(month))
     names = list(g.UPSTREAMS)
+    bill = await gpu_bill.read(now) if gpu_bill else {"connected": False}
     return {"generated": g.iso(now),
             "settings": {"gpu_hourly": GPU_HOURLY or None, "speed_bar": stats.SPEED_BAR,
                          "prices": {p: c / 100 for p, c in checkout.PRICES.items()}},
             "health": {"model": await g.reachable(g.UPSTREAMS[names[0]]) if names else False,
-                       "bitcart": sales is not None},
-            "summary": summary(sales, key_rows, hourly, gpu_hours(month), now),
+                       "bitcart": sales is not None, "gpu_bill": bill.get("ok") if bill["connected"] else None},
+            "summary": summary(sales, key_rows, hourly, gpu_hours(month), now,
+                               bill.get("spent_30d") if bill.get("ok") else None),
+            "gpu_bill": bill,
             "sales": sales[:300] if sales is not None else None,
             "wallets": await wallets(raw[0] if raw else None) if raw is not None else None,
             "keys": key_rows, "orders": orders, "hourly": hourly, "load": load}
 
 
-@router.post("/v1/admin/run")
-async def run(request: Request):
-    refused = gate(request)
+@router.post("/v1/{door}/run")
+async def run(door: str, request: Request):
+    refused = gate(request, door)
     if refused is not None:
         return refused
     g = checkout.gw()

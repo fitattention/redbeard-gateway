@@ -413,6 +413,27 @@ def test_hang_up_mid_reply():
             s.should_exit = True
 
 
+def test_stats_file_from_before_a_new_counter(tmp_path=None):
+    """A stats file written before a counter existed gains its column on start (else every write would silently fail)."""
+    import os
+    import tempfile
+    path = os.path.join(tempfile.mkdtemp(), "old.db")
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE hourly (hour INTEGER NOT NULL, plan TEXT NOT NULL, source TEXT NOT NULL, requests INTEGER "
+                "NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (hour, plan, source))")
+    old.execute("INSERT INTO hourly (hour, plan, source, requests) VALUES (0, 'max', 'chat', 7)")
+    old.commit(); old.close()
+    saved = stats._db
+    try:
+        stats._db = stats.connect(path)
+        stats.add("max", "chat", now=0, failed=1, offline=1)
+        hourly, _ = stats.rows(0)
+        assert hourly[0]["requests"] == 7 and hourly[0]["offline"] == 1 and hourly[0]["upstream_micros"] == 0
+    finally:
+        stats._db.close()
+        stats._db = saved
+
+
 def test_box_drops_mid_reply():
     """The model server dies partway through a reply: the customer gets an explicit error, and pays only what came."""
     class Dies(httpx.AsyncByteStream):
@@ -675,10 +696,14 @@ def test_backoffice():
                          " (?, ?, ?, ?, ?, ?, ?)", (ref, "f" * 64, kind, plan, cents, iid, int(now)))
         stats.add("power", "api", prompt_tokens=800, completion_tokens=900)              # counts 1,000
         stats.add("max", "chat", completion_tokens=3000)                                 # counts 3,000
+        stats.add("max", "chat", failed=1, offline=1)                                    # asked while the model was off
+        backoffice.gpu_bill = None                                                       # no private bill reader yet
 
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://gw") as gw:
             assert (await gw.get("/v1/admin/overview")).status_code == 404               # no admin key set: not there
             backoffice.ADMIN_HASH = hashlib.sha256(b"rb_admin_test").hexdigest()
+            assert (await gw.get("/v1/admin/overview", headers={"Authorization": "Bearer rb_admin_test"})).status_code == 404  # no path set: off
+            backoffice.ADMIN_PATH = "admin"
             for bad in ({}, {"Authorization": "Bearer rb_admin_wrong"}, {"Authorization": "rb_admin_test"}):
                 assert (await gw.get("/v1/admin/overview", headers=bad)).status_code == 401
             raw_customer, _ = add_key("max")                                             # a customer key is not admin
@@ -686,13 +711,22 @@ def test_backoffice():
             ok = {"Authorization": "Bearer rb_admin_test"}
             r = await gw.get("/v1/admin/overview", headers=ok)
             assert r.status_code == 200, r.text
+            backoffice.ADMIN_PATH = "k3pt-private"                                       # moved to a private path:
+            assert (await gw.get("/v1/admin/overview", headers=ok)).status_code == 404       # even the right key
+            assert (await gw.post("/v1/admin/run", json={"args": ["show", "x"]}, headers=ok)).status_code == 404
+            assert (await gw.get("/v1/k3pt-private/overview", headers=ok)).status_code == 200  # finds only the private one
+            assert (await gw.get("/v1/k3pt-private/overview")).status_code == 401              # and it still needs the key
+            backoffice.ADMIN_PATH = "admin"
             o = r.json()
             s = o["summary"]
             assert s["revenue"] == {"24h": 50.0, "7d": 150.0, "30d": 150.0, "all": 155.0}, s["revenue"]
             assert s["funnel"] == {"started": 4, "paid": 2, "expired": 1, "underpaid": 1, "minutes_to_pay": 6.0}, s["funnel"]
             assert s["keys"]["active"] == {"power": 1, "max": 2, "payg": 1} and s["keys"]["ending_7d"] == 1
             assert s["keys"]["ended"] == 1 and s["keys"]["payg_owed_usd"] == 4.99
-            assert s["gpu"] == {"hours_30d": 1.0, "hourly": 2.0, "cost_30d": 2.0, "margin_30d": 148.0}, s["gpu"]
+            assert s["gpu"] == {"source": "estimate", "hours_30d": 1.0, "hourly": 2.0, "estimate_30d": 2.0, "billed_30d": None,
+                                "outside_ai_30d": 0.0, "cost_30d": 2.0, "margin_30d": 148.0}, s["gpu"]  # answered hours only
+            assert s["offline"] == {"24h": 1, "7d": 1, "30d": 1} and o["gpu_bill"] == {"connected": False}
+            assert o["health"]["gpu_bill"] is None
             assert s["plans"]["power"] == {"active_keys": 1, "tokens_30d": 1000, "revenue_30d": 100.0, "cost_30d": 0.5}
             assert s["plans"]["max"]["cost_30d"] == 1.5 and s["plans"]["starter"]["cost_30d"] == 0.0
             by = {x["id"]: x for x in o["sales"]}
@@ -709,6 +743,24 @@ def test_backoffice():
             assert any(k["fp"] == h_ok for k in o["keys"])
             assert {(x["plan"], x["source"]) for x in o["hourly"]} == {("power", "api"), ("max", "chat")}
             assert o["health"]["bitcart"] is True
+
+            import types                                                                # the private bill reader, faked:
+            async def bill_ok(_now):                                                    # it answers
+                return {"connected": True, "ok": True, "spent_30d": 4.5, "credit": 10.0}
+            async def bill_down(_now):                                                  # it can't reach the provider
+                return {"connected": True, "ok": False}
+            try:
+                backoffice.gpu_bill = types.SimpleNamespace(read=bill_ok)
+                o = (await gw.get("/v1/admin/overview", headers=ok)).json()
+                g_ = o["summary"]["gpu"]
+                assert o["gpu_bill"]["credit"] == 10.0 and o["health"]["gpu_bill"] is True
+                assert g_["source"] == "bill" and g_["billed_30d"] == 4.5 and g_["cost_30d"] == 4.5 and g_["margin_30d"] == 145.5, g_
+                backoffice.gpu_bill = types.SimpleNamespace(read=bill_down)
+                o = (await gw.get("/v1/admin/overview", headers=ok)).json()
+                assert o["health"]["gpu_bill"] is False and o["summary"]["gpu"]["source"] == "estimate"
+                assert o["summary"]["gpu"]["cost_30d"] == 2.0                                # falls back to the estimate
+            finally:
+                backoffice.gpu_bill = None
 
             checkout._client = httpx.AsyncClient(base_url="http://127.0.0.1:9")          # Bitcart down
             o = (await gw.get("/v1/admin/overview", headers=ok)).json()
@@ -738,11 +790,12 @@ def test_backoffice():
                      for _ in range(31)]
             assert codes[:30] == [401] * 30 and codes[30] == 429                          # guessing slowed
 
-    real_balance = backoffice.balance
+    real_balance, real_bill = backoffice.balance, backoffice.gpu_bill
     try:
         asyncio.run(run())
     finally:
         backoffice.balance, backoffice.ADMIN_HASH, backoffice._wallets = real_balance, "", (0.0, [])
+        backoffice.gpu_bill = real_bill
         checkout._client = None
         gateway.app.state.uptime = None
 

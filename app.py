@@ -502,7 +502,7 @@ async def chat(request: Request):
                                        stream=True)
     except httpx.HTTPError:
         stats.end(ticket)
-        stats.add(k.plan, src, failed=1)
+        stats.add(k.plan, src, failed=1, offline=1)
         return error(502, "model_unreachable", f"We're updating {model.title()} right now. "
                      "Check the status page to see when it's back: https://redbeard.sbs/status/")
 
