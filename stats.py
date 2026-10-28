@@ -106,6 +106,16 @@ def finish(plan, src, prompt, completion, waited=None, writing=None, cut=False, 
     add(plan, src, now, **c)
 
 
+def monthly(since):
+    """Totals per UTC month ('2026-10': {...}) for the owner's books: replies, tokens and past outside-AI cost."""
+    out = {}
+    for month, requests, tokens, micros in db().execute(
+            "SELECT strftime('%Y-%m', hour, 'unixepoch'), SUM(requests), SUM(prompt_tokens + completion_tokens),"
+            " SUM(upstream_micros) FROM hourly WHERE hour >= ? GROUP BY 1", (since,)):
+        out[month] = {"requests": requests, "tokens": tokens, "upstream_micros": micros}
+    return out
+
+
 def rows(since):
     cols = ("hour", "plan", "source", *COUNTS)
     hourly = [dict(zip(cols, r)) for r in db().execute(f"SELECT {', '.join(cols)} FROM hourly WHERE hour >= ?"

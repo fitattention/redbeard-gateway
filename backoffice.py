@@ -18,6 +18,7 @@ import hmac
 import os
 import time
 from collections import Counter
+from math import ceil
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from statistics import median
@@ -219,6 +220,56 @@ def summary(sales, key_rows, hourly, hours, now, spent=None):
     return out
 
 
+def accounts(sales, bill, monthly, key_rows, hourly, cost_30d, now):
+    """The owner's books, by UTC month, on a cash basis: a sale counts in the month it was paid. The books start with
+    the month of the first paid sale; GPU spending before that is reported apart, not mixed in. Each figure comes from
+    one record (Bitcart, the GPU bill, the gateway's own counters); anything a record can't give is None, never 0."""
+    month_of = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m")
+    paid = [s for s in sales or [] if s["status"] == "complete"]
+    sold, count, received = Counter(), Counter(), Counter()
+    for s in paid:
+        m = month_of(ts(s["paid_at"] or s["created"]))
+        sold[m] += s["usd"]
+        count[m] += 1
+        received[m] += s["sent"]
+    ok = bool(bill and bill.get("ok"))
+    spent = bill.get("spent_by_month") if ok else None
+    product = bill.get("product_spent_by_month") if ok else None
+    deposited = bill.get("deposited_by_month") if ok else None
+    first = min(sold) if sold else month_of(now)
+    known = sales is not None
+    rows = []
+    for m in sorted({m for m in [*sold, *(spent or {}), *monthly, month_of(now)] if m >= first}, reverse=True):
+        gpu = round(spent.get(m, 0.0), 2) if spent is not None else None
+        outside = round((monthly.get(m) or {}).get("upstream_micros", 0) / 1e6, 2)
+        income = round(sold.get(m, 0.0), 2) if known else None
+        rows.append({"month": m, "sales_usd": income, "sales": count.get(m, 0) if known else None,
+                     "gpu_usd": gpu, "gpu_product_usd": round(product.get(m, 0.0), 2) if product is not None else None,
+                     "outside_ai_usd": outside,
+                     "profit_usd": round(income - gpu - outside, 2) if income is not None and gpu is not None else None,
+                     "cash_in_usdt": round(received.get(m, 0.0), 2) if known else None,
+                     "cash_out_usd": round(deposited.get(m, 0.0), 2) if deposited is not None else None,
+                     "replies": (monthly.get(m) or {}).get("requests", 0), "tokens": (monthly.get(m) or {}).get("tokens", 0)})
+    # owed: plan time already paid for but not yet used (each plan is 30 days from its payment), and prepaid balances
+    unearned = sum(s["usd"] * max(0.0, 30 - (now - ts(s["paid_at"])) / DAY) / 30
+                   for s in paid if s["plan"] != "payg" and s["paid_at"]) if known else None
+    replies, tokens = sum(r["requests"] for r in hourly), sum(r["prompt_tokens"] + r["completion_tokens"] for r in hourly)
+    busy = len({r["hour"] for r in hourly if r["requests"]})
+    box_month = GPU_HOURLY * 24 * 30
+    return {"basis": "cash", "first_month": first, "months": rows,
+            "gpu_before_books_usd": round(sum(v for m, v in spent.items() if m < first), 2) if spent is not None else None,
+            "owed": {"unearned_plans_usd": round(unearned, 2) if unearned is not None else None,
+                     "prepaid_balances_usd": round(sum(k["balance_usd"] or 0 for k in key_rows if k["status"] == "active"), 2)},
+            # busy hours over the 720 clock hours of 30 days: one unit on both sides (status-check hours are a different
+            # measure, and dividing one by the other once gave an impossible 102%)
+            "unit_30d": {"replies": replies, "tokens": tokens, "busy_hours": busy, "clock_hours": 30 * 24,
+                         "cost_per_reply_usd": round(cost_30d / replies, 4) if cost_30d is not None and replies else None,
+                         "cost_per_million_tokens_usd": round(cost_30d / tokens * 1e6, 2) if cost_30d is not None and tokens else None,
+                         "sales": sum(1 for s in paid if ts(s["paid_at"] or s["created"]) >= now - 30 * DAY) if known else None},
+            "break_even": {"box_month_usd": round(box_month, 2) if GPU_HOURLY else None,
+                           "sales_needed": {p: ceil(box_month / (c / 100)) for p, c in checkout.PRICES.items()} if GPU_HOURLY else None}}
+
+
 @router.get("/v1/{door}/overview")
 async def overview(door: str, request: Request):
     refused = gate(request, door)
@@ -245,13 +296,16 @@ async def overview(door: str, request: Request):
     hourly, load = stats.rows(stats.hour_of(month))
     names = list(g.UPSTREAMS)
     bill = await gpu_bill.read(now) if gpu_bill else {"connected": False}
+    hours = gpu_hours(month)
+    totals = summary(sales, key_rows, hourly, hours, now, bill.get("spent_30d") if bill.get("ok") else None)
     return {"generated": g.iso(now),
             "settings": {"gpu_hourly": GPU_HOURLY or None, "speed_bar": stats.SPEED_BAR,
                          "prices": {p: c / 100 for p, c in checkout.PRICES.items()}},
             "health": {"model": await g.reachable(g.UPSTREAMS[names[0]]) if names else False,
                        "bitcart": sales is not None, "gpu_bill": bill.get("ok") if bill["connected"] else None},
-            "summary": summary(sales, key_rows, hourly, gpu_hours(month), now,
-                               bill.get("spent_30d") if bill.get("ok") else None),
+            "summary": totals,
+            "accounts": accounts(sales, bill, stats.monthly(stats.hour_of(now - stats.KEEP_DAYS * DAY)), key_rows, hourly,
+                                 totals["gpu"]["cost_30d"], now),
             "gpu_bill": bill,
             "sales": sales[:300] if sales is not None else None,
             "wallets": await wallets(raw[0] if raw else None) if raw is not None else None,

@@ -744,9 +744,29 @@ def test_backoffice():
             assert {(x["plan"], x["source"]) for x in o["hourly"]} == {("power", "api"), ("max", "chat")}
             assert o["health"]["bitcart"] is True
 
+            from collections import Counter                                              # the books
+            from math import ceil
+            mo = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m")
+            want = Counter()
+            for usd, paid_at in ((100, now - 2 * DAY + 120), (5, now - 40 * DAY + 60), (50, now - 2 * HOUR + 600)):
+                want[mo(paid_at)] += usd
+            a_ = o["accounts"]
+            rows = {r["month"]: r for r in a_["months"]}
+            assert a_["first_month"] == min(want) and all(rows[m]["sales_usd"] == usd for m, usd in want.items()), rows
+            assert all(r["gpu_usd"] is None and r["profit_usd"] is None for r in a_["months"])  # no bill: unknown, never 0
+            unearned = 100 * (30 - (2 * DAY - 120) / DAY) / 30 + 50 * (30 - (2 * HOUR - 600) / DAY) / 30  # the payg sale owes no time
+            assert abs(a_["owed"]["unearned_plans_usd"] - unearned) < 0.05 and a_["owed"]["prepaid_balances_usd"] == 4.99
+            assert a_["unit_30d"]["tokens"] == 4700 and a_["unit_30d"]["cost_per_million_tokens_usd"] == round(2.0 / 4700 * 1e6, 2)
+            assert a_["unit_30d"]["cost_per_reply_usd"] is None                          # no replies counted: no ratio
+            assert a_["unit_30d"]["busy_hours"] == 0 and a_["unit_30d"]["clock_hours"] == 720  # one unit on both sides
+            assert a_["break_even"] == {"box_month_usd": 1440.0,
+                                        "sales_needed": {p: ceil(1440 / (c / 100)) for p, c in checkout.PRICES.items()}}
+
             import types                                                                # the private bill reader, faked:
             async def bill_ok(_now):                                                    # it answers
-                return {"connected": True, "ok": True, "spent_30d": 4.5, "credit": 10.0}
+                return {"connected": True, "ok": True, "spent_30d": 4.5, "credit": 10.0,
+                        "spent_by_month": {mo(now): 4.5, "2000-01": 9.0}, "product_spent_by_month": {mo(now): 3.0},
+                        "deposited_by_month": {mo(now): 25.0}}
             async def bill_down(_now):                                                  # it can't reach the provider
                 return {"connected": True, "ok": False}
             try:
@@ -755,6 +775,11 @@ def test_backoffice():
                 g_ = o["summary"]["gpu"]
                 assert o["gpu_bill"]["credit"] == 10.0 and o["health"]["gpu_bill"] is True
                 assert g_["source"] == "bill" and g_["billed_30d"] == 4.5 and g_["cost_30d"] == 4.5 and g_["margin_30d"] == 145.5, g_
+                a_ = o["accounts"]
+                this = {r["month"]: r for r in a_["months"]}[mo(now)]
+                assert this["gpu_usd"] == 4.5 and this["gpu_product_usd"] == 3.0 and this["cash_out_usd"] == 25.0
+                assert this["profit_usd"] == round(want.get(mo(now), 0) - 4.5, 2)
+                assert a_["gpu_before_books_usd"] == 9.0 and "2000-01" not in {r["month"] for r in a_["months"]}  # kept apart
                 backoffice.gpu_bill = types.SimpleNamespace(read=bill_down)
                 o = (await gw.get("/v1/admin/overview", headers=ok)).json()
                 assert o["health"]["gpu_bill"] is False and o["summary"]["gpu"]["source"] == "estimate"
