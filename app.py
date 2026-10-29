@@ -29,6 +29,7 @@ import meter
 import stats
 import store
 import images as image_input
+import reader
 
 UPSTREAMS = json.loads(os.environ.get("REDBEARD_UPSTREAMS", '{"sherlock": "http://127.0.0.1:8000"}'))
 UPSTREAM_KEY = os.environ.get("REDBEARD_UPSTREAM_KEY", "")
@@ -162,25 +163,35 @@ async def run_search(query: str, limit: int = 5):
     return out
 
 
-# Extract readable page text. The route returns bounded sections with explicit continuation metadata.
-# The reader proxy renders the page server-side and returns clean markdown,
-# which gets past most bot blocks that a plain fetch (403s) cannot. Hard CAPTCHA/paywall sites still resist; that
-# needs a full headless browser, out of scope. Falls back to a direct fetch + crude tag-strip if the reader fails.
-READER = "https://r.jina.ai/"
+# Readable page text from RedBeard's own reader (reader.py: plain fetch, the article or the whole page, PDFs, a hidden
+# Chromium for pages that need one; no outside service, the owner 2026-10-29). The route hands it out in bounded sections.
 PAGE_CHARS = 6000
+BROWSER = reader.Browser(pages=int(os.environ.get("REDBEARD_READER_PAGES", "2")))
+# A page read in parts comes from one copy: the first read keeps the text for 10 minutes for that key, so part 2 never
+# sees a page that changed in between (GitHub's release list did, 2026-10-29). Per key: never shared between keys.
+# ponytail: at most 100 pages in memory, oldest dropped first; size by memory if pages get large.
+SNAPSHOT_SECONDS, SNAPSHOT_MAX = 600, 100
+snapshots: dict[tuple[str, str], tuple[float, str]] = {}
 
 
-def walled(text: str) -> bool:
-    """A bot wall or error page in place of the page. Seen 2026-10-29 (30-site sweep): npm, Stack Overflow and Reddit
-    came back as Cloudflare's "Just a moment..." with the reader's "Target URL returned error 403", Reuters as
-    "Please enable JS and disable any ad blocker"; all were handed on as if they were the page."""
-    head = text[:800]
-    return bool(re.search(r"Target URL returned error (?:401|403|429|451)\b", head)
-                or re.search(r"^Title: Just a moment\.\.\.", head, re.M)
-                or (len(text) < 1500 and "enable JS" in text)
-                # the live re-check after deploy found the reader's other wording ("Warning: This page maybe requiring
-                # CAPTCHA", Reuters, 179 characters): a tiny answer that carries a reader warning is not the page
-                or (len(text) < 1000 and re.search(r"^Warning: ", head, re.M)))
+def snapshot(key_hash: str, url: str):
+    now = time.time()
+    for k, (t, _) in list(snapshots.items()):
+        if now - t > SNAPSHOT_SECONDS:
+            del snapshots[k]
+    hit = snapshots.get((key_hash, url))
+    return hit[1] if hit else None
+
+
+def remember(key_hash: str, url: str, text: str):
+    if len(snapshots) >= SNAPSHOT_MAX:
+        del snapshots[min(snapshots, key=lambda k: snapshots[k][0])]
+    snapshots[(key_hash, url)] = (time.time(), text)
+
+
+async def read_page(url: str) -> str:
+    """The one place a page becomes text (the route's tests swap it for fixed text)."""
+    return await reader.read(url, client(), BROWSER.render)
 
 
 async def fetch_page(url: str, limit_chars: int | None = PAGE_CHARS) -> str:
@@ -188,25 +199,9 @@ async def fetch_page(url: str, limit_chars: int | None = PAGE_CHARS) -> str:
     if not url.startswith(("http://", "https://")):
         return ""
     try:
-        r = await client().get(READER + url, headers={"User-Agent": SEARCH_UA, "X-Return-Format": "markdown"}, timeout=25)
-        text = r.text if r.status_code == 200 else ""
+        text = await read_page(url)
     except Exception:
         text = ""
-    if len(text) < 200 or walled(text):  # nothing useful, or a bot wall: try the page directly
-        kept = "" if walled(text) else text
-        try:
-            d = await client().get(url, headers={"User-Agent": SEARCH_UA}, timeout=15, follow_redirects=True)
-            kind = d.headers.get("content-type", "").lower()
-            # only a real text page: an error page isn't the page, and a PDF or other file read as text is unreadable
-            # code (an arXiv PDF came back as 1 million characters of it, 2026-10-29)
-            if d.status_code == 200 and kind.startswith(("text/", "application/xhtml")):
-                direct = re.sub(r"\s+\n", "\n", re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", d.text, flags=re.S | re.I))
-                direct = htmllib.unescape(re.sub(r"<[^>]+>", " ", direct))
-                text = direct if len(direct.strip()) >= 200 and not walled(direct) else kept
-            else:
-                text = kept
-        except Exception:
-            text = kept
     return text if limit_chars is None else text[:limit_chars]
 
 
@@ -363,6 +358,11 @@ async def _start_recorder():
     asyncio.create_task(record_uptime())  # not started under test transports (no lifespan)
 
 
+@app.on_event("shutdown")
+async def _stop_browser():
+    await BROWSER.close()
+
+
 @app.get("/v1/uptime")
 async def uptime(request: Request):
     """Public: per-component daily uptime for the last 90 days. pct is null for days with no sample."""
@@ -461,10 +461,15 @@ async def fetch_route(request: Request):
     if too_many("search", k.key_hash, 15):
         return error(429, "rate_limited", "Too many requests. Wait a minute.")
     stats.add(k.plan, stats.source(request), fetches=1)
-    try:
-        text = await fetch_page(url, limit_chars=None)
-    except Exception:
-        text = ""
+    # a continuation (offset or page_id) reads the key's snapshot of the page; a first read fetches it fresh
+    text = snapshot(k.key_hash, url) if (offset or expected_page) else None
+    if text is None:
+        try:
+            text = await fetch_page(url, limit_chars=None)
+        except Exception:
+            text = ""
+        if text:
+            remember(k.key_hash, url, text)
     if not text:
         return error(502, "page_unavailable", "The page could not be read: the site blocks automated reading, or it "
                      "isn't a web page (a PDF or other file). Try another source.")

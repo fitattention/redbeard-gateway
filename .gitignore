@@ -6,6 +6,7 @@
 !/images.py
 !/test_images.py
 !/test_reader.py
+!/reader.py
 !/meter.py
 !/store.py
 !/admin.py
