@@ -149,6 +149,12 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
         self.text, self.direct_status = "reuters.com\n\nPlease enable JS and disable any ad blocker" + " " * 200, 401
         self.assertEqual((await self.read()).status_code, 502)
 
+    async def test_captcha_warning_is_not_handed_on(self):
+        self.text = ("Title: reuters.com\n\nURL Source: https://www.reuters.com/\n\nWarning: This page maybe requiring "
+                     "CAPTCHA, please make sure you are authorized to access this page.\n\nMarkdown Content:\n")
+        self.direct_status = 401
+        self.assertEqual((await self.read()).status_code, 502)
+
     async def test_pdf_is_not_read_as_text(self):
         self.reader_status, self.direct_type = 403, "application/pdf"
         self.html = "%PDF-1.5\n%\xe2\xe3\xcf\xd3\n137 0 obj stream " + "\x00\x01binary" * 500

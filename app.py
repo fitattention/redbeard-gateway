@@ -177,7 +177,10 @@ def walled(text: str) -> bool:
     head = text[:800]
     return bool(re.search(r"Target URL returned error (?:401|403|429|451)\b", head)
                 or re.search(r"^Title: Just a moment\.\.\.", head, re.M)
-                or (len(text) < 1500 and "enable JS" in text))
+                or (len(text) < 1500 and "enable JS" in text)
+                # the live re-check after deploy found the reader's other wording ("Warning: This page maybe requiring
+                # CAPTCHA", Reuters, 179 characters): a tiny answer that carries a reader warning is not the page
+                or (len(text) < 1000 and re.search(r"^Warning: ", head, re.M)))
 
 
 async def fetch_page(url: str, limit_chars: int | None = PAGE_CHARS) -> str:
