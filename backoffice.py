@@ -270,6 +270,23 @@ def accounts(sales, bill, monthly, key_rows, hourly, cost_30d, now):
                            "sales_needed": {p: ceil(box_month / (c / 100)) for p, c in checkout.PRICES.items()} if GPU_HOURLY else None}}
 
 
+def download_totals(rows, now):
+    """App downloads (stats.downloads rows) per file for the last 24 hours, 7 and 30 days and all kept, and per
+    UTC day for the last 30 days. Counts only: the table holds no visitor detail."""
+    files = {}
+    for r in rows:
+        f = files.setdefault(r["file"], {"24h": 0, "7d": 0, "30d": 0, "all": 0})
+        f["all"] += r["count"]
+        for name, span in (("24h", DAY), ("7d", 7 * DAY), ("30d", 30 * DAY)):
+            if now - r["hour"] < span:
+                f[name] += r["count"]
+    days = {}
+    for r in rows:
+        if now - r["hour"] < 30 * DAY:
+            days[r["hour"] // DAY * DAY] = days.get(r["hour"] // DAY * DAY, 0) + r["count"]
+    return {"files": files, "daily": [{"day": d, "count": c} for d, c in sorted(days.items())]}
+
+
 @router.get("/v1/{door}/overview")
 async def overview(door: str, request: Request):
     refused = gate(request, door)
@@ -309,7 +326,8 @@ async def overview(door: str, request: Request):
             "gpu_bill": bill,
             "sales": sales[:300] if sales is not None else None,
             "wallets": await wallets(raw[0] if raw else None) if raw is not None else None,
-            "keys": key_rows, "orders": orders, "hourly": hourly, "load": load}
+            "keys": key_rows, "orders": orders, "hourly": hourly, "load": load,
+            "downloads": download_totals(stats.downloads(stats.hour_of(now - stats.KEEP_DAYS * DAY)), now)}
 
 
 @router.post("/v1/{door}/run")

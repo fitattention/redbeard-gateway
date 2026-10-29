@@ -23,7 +23,7 @@ from urllib.parse import unquote
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 import meter
 import stats
@@ -249,6 +249,23 @@ def panel(k, raw):
         ]
     return {"plan": {"id": k.plan, "name": name, "multiplier": multiplier}, "key_hint": "••••" + raw[-4:],
             "paid_until": iso(k.paid_until), "windows": windows, "balance": balance}
+
+
+# The app's downloads. The website and install.sh link here so the owner's back office can count them: +1 per hour
+# and file name in stats.db, nothing about who (no address, browser or key is stored). The file itself is the
+# website's own /download/ copy; this only counts and sends the browser on.
+DOWNLOADS = ("RedBeard-Setup.exe", "redbeard-linux-x64.tar.gz", "redbeard-darwin-arm64.tar.gz", "redbeard-darwin-x64.tar.gz")
+
+
+@app.get("/v1/dl/{name}")
+async def download(name: str, request: Request):
+    if name not in DOWNLOADS:
+        return error(404, "not_found", "No such download.")
+    # at most 5 counted a minute from one address, so a loop can't inflate the number (the address is held in memory
+    # for that minute, like every rate limit here, and never written down); the download itself is never refused
+    if not too_many("dl", client_ip(request), 5):
+        stats.download(name)
+    return RedirectResponse(f"/download/{name}", status_code=302, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/v1/healthz")

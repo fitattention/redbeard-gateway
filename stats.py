@@ -1,5 +1,6 @@
 """Anonymous hourly totals for the whole service, for the owner's back office. No key, no fingerprint, no word of
-content: a row is one hour x plan x source (the website chat or the API) and holds only counts and sums.
+content: a row is one hour x plan x source (the website chat or the API) and holds only counts and sums. App
+downloads are counted the same way: one hour x file name, a count.
 
 Written as things happen (one small UPSERT, like the key counters). "At once" (replies streaming at the same moment)
 and "keys" (how many different keys were active in the hour) are worked out in memory and stored as numbers only.
@@ -30,6 +31,9 @@ def connect(path):
     c.execute("CREATE TABLE IF NOT EXISTS hourly (hour INTEGER NOT NULL, plan TEXT NOT NULL, source TEXT NOT NULL, "
               + ", ".join(f"{n} INTEGER NOT NULL DEFAULT 0" for n in COUNTS) + ", PRIMARY KEY (hour, plan, source))")
     c.execute("CREATE TABLE IF NOT EXISTS load (hour INTEGER PRIMARY KEY, at_once INTEGER NOT NULL, keys INTEGER NOT NULL)")
+    # downloads of the RedBeard app: an hour, a file name, a count. Nothing about who downloaded.
+    c.execute("CREATE TABLE IF NOT EXISTS downloads (hour INTEGER NOT NULL, file TEXT NOT NULL, "
+              "count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (hour, file))")
     columns = {row[1] for row in c.execute("PRAGMA table_info(hourly)")}
     for name in COUNTS:  # a counter added later joins an older file as a new column, zero for the hours before it
         if name not in columns:
@@ -104,6 +108,22 @@ def finish(plan, src, prompt, completion, waited=None, writing=None, cut=False, 
     if writing and writing > 0 and completion >= MIN_FOR_SPEED and not cut:
         c.update(gen_tokens=completion, gen_ms=round(writing * 1000), timed=1, slow=int(completion / writing < SPEED_BAR))
     add(plan, src, now, **c)
+
+
+def download(file, now=None):
+    """One download of the app began (app.py's /v1/dl). Stores the hour and the file name only."""
+    try:
+        h = hour_of(now if now is not None else time.time())
+        db().execute("INSERT INTO downloads (hour, file, count) VALUES (?, ?, 1)"
+                     " ON CONFLICT(hour, file) DO UPDATE SET count = count + 1", (h, file))
+        db().execute("DELETE FROM downloads WHERE hour < ?", (h - KEEP_DAYS * 86400,))
+    except sqlite3.Error:
+        pass
+
+
+def downloads(since):
+    return [dict(zip(("hour", "file", "count"), r))
+            for r in db().execute("SELECT hour, file, count FROM downloads WHERE hour >= ? ORDER BY hour", (since,))]
 
 
 def monthly(since):

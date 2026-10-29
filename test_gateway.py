@@ -849,6 +849,40 @@ def test_admin():
             pass
 
 
+def test_downloads():
+    """The app's download counter: counts only real files, sends the browser on to /download/, holds at most 5 a
+    minute from one address without ever refusing the download, stores hour + file + count and nothing about who,
+    and a broken stats file never stops a download."""
+    import backoffice
+
+    async def run():
+        fresh_gateway()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://gw") as gw:
+            r = await gw.get("/v1/dl/secret.txt")
+            assert r.status_code == 404 and stats.downloads(0) == []
+            for _ in range(8):                                   # one address, eight downloads in a minute
+                r = await gw.get("/v1/dl/RedBeard-Setup.exe")
+                assert r.status_code == 302 and r.headers["location"] == "/download/RedBeard-Setup.exe"
+                assert r.headers["cache-control"] == "no-store"
+            gateway.hits.clear()                                 # a new minute
+            assert (await gw.get("/v1/dl/redbeard-darwin-arm64.tar.gz")).status_code == 302
+            counts = {d["file"]: d["count"] for d in stats.downloads(0)}
+            assert counts == {"RedBeard-Setup.exe": 5, "redbeard-darwin-arm64.tar.gz": 1}, counts
+            assert [c[1] for c in stats.db().execute("PRAGMA table_info(downloads)")] == ["hour", "file", "count"]
+            assert "127.0.0.1" not in str(stats.db().execute("SELECT * FROM downloads").fetchall())
+            now = int(time.time())
+            t = backoffice.download_totals(stats.downloads(0), now)
+            assert t["files"]["RedBeard-Setup.exe"] == {"24h": 5, "7d": 5, "30d": 5, "all": 5}
+            assert sum(d["count"] for d in t["daily"]) == 6
+            old = backoffice.download_totals([{"hour": now - 40 * DAY, "file": "x", "count": 2}], now)
+            assert old["files"]["x"] == {"24h": 0, "7d": 0, "30d": 0, "all": 2} and old["daily"] == []
+            stats._db.close()                                    # a broken stats file
+            gateway.hits.clear()
+            assert (await gw.get("/v1/dl/redbeard-linux-x64.tar.gz")).status_code == 302
+        stats._db = stats.connect(":memory:")
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     import sys
     failed = 0
