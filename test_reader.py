@@ -14,6 +14,7 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
         self.text = ("A readable line with an emoji 🙂 and an accent é.\n" * 400)
         self.reader_status = 200
         self.html = ""
+        self.direct_status, self.direct_type = 200, None  # the page itself, when fetched directly
         self.requests = []
         gateway.hits.clear()
         gateway.app.state.conn = store.connect(":memory:")
@@ -25,7 +26,8 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
             self.requests.append(str(request.url))
             if str(request.url).startswith(gateway.READER):
                 return httpx.Response(self.reader_status, text=self.text)
-            return httpx.Response(200, text=self.html)
+            return httpx.Response(self.direct_status, text=self.html,
+                                  headers={"content-type": self.direct_type} if self.direct_type else None)
 
         gateway.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(reader))
         self.api = httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://local")
@@ -125,6 +127,45 @@ class ReaderTests(unittest.IsolatedAsyncioTestCase):
         second = (await self.read(**first["next_read"])).json()
         self.assertNotEqual(first["content"], second["content"])
         self.assertEqual(second["offset"], 6000)
+
+    # 2026-10-29 sweep: bot walls and files were handed on as if they were the page
+    WALL = ("Title: Just a moment...\n\nURL Source: https://fixture.test/page\n\nWarning: Target URL returned error 403: "
+            "Forbidden\n\nMarkdown Content:\nVerify you are human by completing the action below.\n" + "x" * 250)
+
+    async def test_bot_wall_is_not_handed_on(self):
+        self.text, self.direct_status, self.html = self.WALL, 403, "<html>Forbidden</html>" * 50
+        response = await self.read()
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"]["code"], "page_unavailable")
+
+    async def test_bot_wall_then_the_page_itself(self):
+        self.text, self.direct_type = self.WALL, "text/html; charset=utf-8"
+        self.html = "<html><body>" + "The real article text. " * 100 + "</body></html>"
+        page = (await self.read()).json()
+        self.assertIn("The real article text.", page["content"])
+        self.assertNotIn("Just a moment", page["content"])
+
+    async def test_js_wall_is_not_handed_on(self):
+        self.text, self.direct_status = "reuters.com\n\nPlease enable JS and disable any ad blocker" + " " * 200, 401
+        self.assertEqual((await self.read()).status_code, 502)
+
+    async def test_pdf_is_not_read_as_text(self):
+        self.reader_status, self.direct_type = 403, "application/pdf"
+        self.html = "%PDF-1.5\n%\xe2\xe3\xcf\xd3\n137 0 obj stream " + "\x00\x01binary" * 500
+        self.assertEqual((await self.read()).status_code, 502)
+
+    async def test_direct_error_page_is_not_handed_on(self):
+        self.reader_status, self.direct_status = 503, 404
+        self.html = "<html><body>" + "Page not found on this site. " * 50 + "</body></html>"
+        self.assertEqual((await self.read()).status_code, 502)
+
+    async def test_real_pages_mentioning_walls_still_read(self):
+        long_js = "Some articles say: please enable JS for the video. " + "Real paragraph text. " * 200
+        late_warning = "x" * 900 + " Target URL returned error 403 is a phrase this article explains."
+        for text in (long_js, late_warning):
+            self.text = text
+            page = (await self.read()).json()
+            self.assertEqual(page["total_chars"], len(text))
 
 
 if __name__ == "__main__":

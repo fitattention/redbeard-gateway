@@ -170,6 +170,16 @@ READER = "https://r.jina.ai/"
 PAGE_CHARS = 6000
 
 
+def walled(text: str) -> bool:
+    """A bot wall or error page in place of the page. Seen 2026-10-29 (30-site sweep): npm, Stack Overflow and Reddit
+    came back as Cloudflare's "Just a moment..." with the reader's "Target URL returned error 403", Reuters as
+    "Please enable JS and disable any ad blocker"; all were handed on as if they were the page."""
+    head = text[:800]
+    return bool(re.search(r"Target URL returned error (?:401|403|429|451)\b", head)
+                or re.search(r"^Title: Just a moment\.\.\.", head, re.M)
+                or (len(text) < 1500 and "enable JS" in text))
+
+
 async def fetch_page(url: str, limit_chars: int | None = PAGE_CHARS) -> str:
     url = url.strip()
     if not url.startswith(("http://", "https://")):
@@ -179,13 +189,21 @@ async def fetch_page(url: str, limit_chars: int | None = PAGE_CHARS) -> str:
         text = r.text if r.status_code == 200 else ""
     except Exception:
         text = ""
-    if len(text) < 200:  # reader gave nothing useful: try the page directly
+    if len(text) < 200 or walled(text):  # nothing useful, or a bot wall: try the page directly
+        kept = "" if walled(text) else text
         try:
             d = await client().get(url, headers={"User-Agent": SEARCH_UA}, timeout=15, follow_redirects=True)
-            text = re.sub(r"\s+\n", "\n", re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", d.text, flags=re.S | re.I))
-            text = htmllib.unescape(re.sub(r"<[^>]+>", " ", text))
+            kind = d.headers.get("content-type", "").lower()
+            # only a real text page: an error page isn't the page, and a PDF or other file read as text is unreadable
+            # code (an arXiv PDF came back as 1 million characters of it, 2026-10-29)
+            if d.status_code == 200 and kind.startswith(("text/", "application/xhtml")):
+                direct = re.sub(r"\s+\n", "\n", re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", d.text, flags=re.S | re.I))
+                direct = htmllib.unescape(re.sub(r"<[^>]+>", " ", direct))
+                text = direct if len(direct.strip()) >= 200 and not walled(direct) else kept
+            else:
+                text = kept
         except Exception:
-            text = text or ""
+            text = kept
     return text if limit_chars is None else text[:limit_chars]
 
 
@@ -445,7 +463,8 @@ async def fetch_route(request: Request):
     except Exception:
         text = ""
     if not text:
-        return error(502, "page_unavailable", "The page could not be read; it may block automated access.")
+        return error(502, "page_unavailable", "The page could not be read: the site blocks automated reading, or it "
+                     "isn't a web page (a PDF or other file). Try another source.")
     page_id = hashlib.sha256(text.encode("utf-8")).hexdigest()
     if expected_page is not None and expected_page != page_id:
         return error(409, "page_changed", "The page changed between reads. Restart at offset 0 before combining sections.",
