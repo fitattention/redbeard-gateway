@@ -3,7 +3,7 @@
   python admin.py new starter          a new key with 30 days paid (also power, max). The key is printed ONCE.
   python admin.py new payg 20          a new pay-as-you-go key holding $20
   python admin.py extend KEY           one more payment: 30 more days on a plan key
-  python admin.py topup KEY 20         add $20 to a pay-as-you-go key
+  python admin.py topup KEY 20         add $20 of credit to a key (on a plan key: extra usage)
   python admin.py revoke KEY           refuse the key from now on
   python admin.py show KEY             plan, paid until, usage
   python admin.py order REF            a checkout order: what it was for, credited or not (support)
@@ -42,7 +42,8 @@ def describe(k):
     if k.plan == "payg":
         return f"plan payg, balance ${k.balance_micros / 1_000_000:.2f}, revoked {bool(k.revoked)}"
     return (f"plan {k.plan}, paid until {when(k.paid_until)}, used {k.fh_used:,} in this 5-hour window, "
-            f"{k.wk_used:,} this week, revoked {bool(k.revoked)}")
+            f"{k.wk_used:,} this week, revoked {bool(k.revoked)}"
+            + (f", extra usage ${k.balance_micros / 1_000_000:.2f}" if k.balance_cap or k.balance_micros else ""))
 
 
 def main(args, conn):
@@ -67,8 +68,6 @@ def main(args, conn):
                 raise ValueError("pay-as-you-go keys are topped up, not extended")
             meter.extend(k, now)
         elif args[0] == "topup":
-            if k.plan != "payg":
-                raise ValueError("plan keys are extended, not topped up")
             k.balance_micros += dollars(args[2] if len(args) > 2 else "")
             k.balance_cap = k.balance_micros       # a top-up fills the tank: the bar reads full again
         elif args[0] == "revoke":

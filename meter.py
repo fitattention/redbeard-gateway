@@ -50,10 +50,10 @@ def refresh(key, now: int) -> None:
         key.wk_start, key.wk_used = week_start(now), 0
 
 
-def blocked(key, now: int):
-    """None if the key may start a reply, else (reason, resets_at). Call refresh first."""
+def plan_stop(key, now: int):
+    """None if the key's monthly plan can pay for a reply now, else (reason, resets_at). Call refresh first."""
     if key.plan == "payg":
-        return ("balance", None) if key.balance_micros <= 0 else None
+        return ("balance", None)
     if key.paid_until is None or now >= key.paid_until:
         return ("expired", key.paid_until)
     limits = PLANS[key.plan]
@@ -64,13 +64,21 @@ def blocked(key, now: int):
     return None
 
 
+def blocked(key, now: int):
+    """None if the key may start a reply, else (reason, resets_at). Call refresh first.
+    The plan pays first; prepaid credit on the key (extra usage) pays when the plan can't: a limit reached, the plan
+    ended, or no plan at all (pay-as-you-go). The reason given is the plan's, so a customer sees what to wait for."""
+    stop = plan_stop(key, now)
+    return None if stop is None or key.balance_micros > 0 else stop
+
+
 def counted(prompt_tokens: int, completion_tokens: int) -> int:
     return completion_tokens + prompt_tokens // READ_DIVISOR
 
 
 def charge(key, prompt_tokens: int, completion_tokens: int, now: int) -> None:
-    """Add a finished reply to the key: counters for plans, money for pay-as-you-go."""
-    if key.plan == "payg":
+    """Add a finished reply to the key: the plan's counters while the plan can pay, else money off the credit."""
+    if plan_stop(key, now) is not None:
         key.balance_micros -= completion_tokens * WRITE_MICROS + prompt_tokens * READ_MICROS
         return
     if key.fh_start is None:

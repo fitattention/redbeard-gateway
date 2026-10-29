@@ -151,7 +151,8 @@ def keys(conn, now):
         v = replace(k)
         meter.refresh(v, now)  # on a copy: looking at a key never changes it
         payg = k.plan == "payg"
-        live = k.balance_micros > 0 if payg else bool(k.paid_until and now < k.paid_until)
+        credit = payg or bool(k.balance_cap or k.balance_micros)     # a plan key can hold credit too (extra usage)
+        live = k.balance_micros > 0 or (not payg and bool(k.paid_until and now < k.paid_until))
         limits = meter.PLANS.get(k.plan) or {}
         pct = lambda used, cap: round(min(100.0, 100 * used / cap), 1) if cap else None
         out.append({
@@ -161,8 +162,8 @@ def keys(conn, now):
             "days_left": None if payg or k.paid_until is None else round((k.paid_until - now) / DAY, 1),
             "five_hour_pct": None if payg else pct(v.fh_used, limits.get("five_hour")),
             "week_pct": None if payg else pct(v.wk_used, limits.get("weekly")),
-            "balance_usd": round(k.balance_micros / 1e6, 2) if payg else None,
-            "balance_left_pct": pct(k.balance_micros, max(k.balance_cap, k.balance_micros)) if payg else None})
+            "balance_usd": round(k.balance_micros / 1e6, 2) if credit else None,
+            "balance_left_pct": pct(k.balance_micros, max(k.balance_cap, k.balance_micros)) if credit else None})
     return out
 
 

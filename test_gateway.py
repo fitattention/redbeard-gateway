@@ -51,6 +51,30 @@ def test_payg():
     assert meter.blocked(k, SUN) == ("balance", None)
 
 
+def test_extra_usage():
+    now = SUN + 10 * HOUR
+    limits = meter.PLANS["starter"]
+    k = plan_key()
+    k.balance_micros = k.balance_cap = 3_000_000                           # a Starter key holding $3 of credit
+    meter.charge(k, prompt_tokens=800, completion_tokens=900, now=now)     # within the allowance: the plan pays
+    assert k.balance_micros == 3_000_000 and k.fh_used == 1_000
+    k.fh_used = limits["five_hour"]                                        # 5-hour allowance used up
+    assert meter.plan_stop(k, now + HOUR) == ("five_hour", now + 5 * HOUR)
+    assert meter.blocked(k, now + HOUR) is None                            # ...but the credit carries on
+    meter.charge(k, prompt_tokens=1_000, completion_tokens=100, now=now + HOUR)
+    assert k.balance_micros == 3_000_000 - 100 * 10 - 1_000 and k.fh_used == limits["five_hour"]  # credit paid
+    k.balance_micros = 0
+    assert meter.blocked(k, now + HOUR) == ("five_hour", now + 5 * HOUR)   # no credit left: wait for the window
+    k.balance_micros = -500                                                # a reply that cost more than was left
+    assert meter.blocked(k, now + HOUR) == ("five_hour", now + 5 * HOUR)
+    k = plan_key(paid_days=0)                                              # the plan has ended...
+    assert meter.blocked(k, now) == ("expired", SUN)
+    k.balance_micros = 2_000_000                                           # ...with $2 of credit left: it works
+    assert meter.blocked(k, now) is None
+    meter.charge(k, prompt_tokens=0, completion_tokens=1_000, now=now)
+    assert k.balance_micros == 2_000_000 - 10_000 and (k.fh_used, k.wk_used) == (0, 0)
+
+
 def test_extend():
     k = store.Key(key_hash="x", plan="power")
     meter.extend(k, SUN)
@@ -224,6 +248,12 @@ async def run_e2e():
         raw6, _ = add_key("payg", balance_micros=2_000_000, balance_cap=5_000_000)    # $2 left of a $5 tank
         r = await gw.post("/v1/session", json={"key": raw6})                          # bar reads 60% spent
         assert r.json()["balance"] == {"currency": "USD", "minor": 200, "used_percent": 60.0}
+        k = used(h); k.balance_micros = k.balance_cap = 1_000_000; store.put(gateway.app.state.conn, k)  # + $1 extra
+        r = await gw.post("/v1/chat/completions", json=ask, headers=auth)            # 5-hour window still full
+        assert r.status_code == 200 and used(h).balance_micros == 1_000_000 - 5 * 10 - 80
+        assert used(h).fh_used == meter.PLANS["starter"]["five_hour"]                # the plan's counters untouched
+        r = await gw.post("/v1/session", json={"key": raw})                          # the panel: plan AND credit
+        assert len(r.json()["windows"]) == 2 and r.json()["balance"]["minor"] == 99
         r = await gw.get("/v1/usage", headers={"Authorization": f"Bearer {raw}"})
         assert [w["used_percent"] for w in r.json()["windows"]] == [100.0, round(100 * used(h).wk_used / meter.PLANS["starter"]["weekly"], 1)]
         assert '"limit"' not in r.text and '"used"' not in r.text                    # token numbers stay private
@@ -590,13 +620,25 @@ async def run_checkout():
         r = (await gw.get(f"/v1/checkout/{o5['order_id']}")).json()
         assert r["underpaid"] is True and store.get(conn, store.hash_key("rb_y")) is None
 
+        o6 = (await gw.post("/v1/checkout", json={"key_hash": hp, "plan": "starter"})).json()   # the $20 key buys
+        invoices[f"inv{len(invoices)}"]["status"] = "complete"                                 # a plan: same key
+        assert (await gw.get(f"/v1/checkout/{o6['order_id']}")).json()["status"] == "paid"
+        k = store.get(conn, hp)
+        assert k.plan == "starter" and k.paid_until > time.time() + 29 * DAY
+        assert k.balance_micros == 20_000_000                                                  # credit kept: extra usage
+        o7 = (await gw.post("/v1/checkout", json={"key_hash": h, "plan": "payg", "amount_usd": 5})).json()
+        assert bitcart_seen[-1][1]["metadata"] == {"kind": "topup", "plan": "payg", "renewal": True}
+        invoices[f"inv{len(invoices)}"]["status"] = "complete"                                 # a plan key adds $5
+        assert (await gw.get(f"/v1/checkout/{o7['order_id']}")).json()["status"] == "paid"
+        k = store.get(conn, h)
+        assert k.plan == "power" and k.paid_until == first + 30 * DAY and k.balance_micros == 5_000_000
+
         gateway.hits.clear()
         bad = [{"key_hash": "abc", "plan": "power"}, {"key_hash": h, "plan": "gold"},
-               {"key_hash": hp, "plan": "power"}, {"key_hash": h, "plan": "payg", "amount_usd": 20},
                {"key_hash": hp, "plan": "payg", "amount_usd": 1}, {"key_hash": hp, "plan": "payg", "amount_usd": "x"},
                {"key_hash": hp, "plan": "payg", "amount_usd": 5000}]
         codes = [(await gw.post("/v1/checkout", json=b)).status_code for b in bad]
-        assert codes == [400, 400, 409, 409, 400, 400, 400], codes
+        assert codes == [400, 400, 400, 400, 400], codes
         assert (await gw.post("/v1/checkout", content=b"junk")).status_code == 400
         assert (await gw.get("/v1/checkout/no-such-order")).status_code == 404
 
@@ -837,16 +879,33 @@ def test_admin():
     assert store.get(conn, k.key_hash).paid_until == first + 30 * DAY                 # stacks
     admin.main(["revoke", k.key_hash], conn)                                          # by fingerprint too
     assert store.get(conn, k.key_hash).revoked == 1
+    raw_s = admin.main(["new", "starter"], conn).splitlines()[0]
+    out = admin.main(["topup", raw_s, "3"], conn)                                      # a plan key + extra usage
+    assert store.get(conn, store.hash_key(raw_s)).balance_micros == 3_000_000 and "extra usage $3.00" in out
     raw_p = admin.main(["new", "payg", "20"], conn).splitlines()[0]
     admin.main(["topup", raw_p, "5.50"], conn)
     assert store.get(conn, store.hash_key(raw_p)).balance_micros == 25_500_000
     for bad in (["new", "free"], ["new", "payg"], ["new", "payg", "-5"], ["new", "payg", "abc"],
-                ["topup", raw, "5"], ["extend", raw_p], ["show", "rb_nope"], ["delete", raw], []):
+                ["extend", raw_p], ["show", "rb_nope"], ["delete", raw], []):
         try:
             admin.main(bad, conn)
             raise AssertionError(f"accepted {bad}")
         except ValueError:
             pass
+
+
+def test_backoffice_extra_usage():
+    import backoffice
+    conn = store.connect(":memory:")
+    now = int(time.time())
+    for h, plan, paid, credit in (("a", "starter", now + DAY, 3_000_000), ("b", "starter", now - DAY, 1_000_000),
+                                  ("c", "starter", now - DAY, 0), ("d", "power", now + DAY, 0)):
+        store.put(conn, store.Key(key_hash=h * 64, plan=plan, paid_until=paid, balance_micros=credit, balance_cap=credit))
+    rows = {r["fp"][0]: r for r in backoffice.keys(conn, now)}
+    assert (rows["a"]["status"], rows["a"]["balance_usd"]) == ("active", 3.0)    # plan + extra usage
+    assert (rows["b"]["status"], rows["b"]["balance_usd"]) == ("active", 1.0)    # plan ended, credit still works
+    assert (rows["c"]["status"], rows["c"]["balance_usd"]) == ("ended", None)
+    assert (rows["d"]["status"], rows["d"]["balance_usd"]) == ("active", None)   # no credit: nothing shown
 
 
 def test_downloads():

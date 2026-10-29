@@ -116,8 +116,8 @@ def refused(reason, resets):
         return error(402, "plan_expired", "This key's 30 days have ended. Pay again to continue.", paid_until=iso(resets))
     if reason == "balance":
         return error(402, "balance_empty", "This key's balance is empty. Top it up to continue.")
-    return error(429, "limit_reached", "You've reached this limit. It resets at the time shown.",
-                 window=reason, resets_at=iso(resets))
+    return error(429, "limit_reached", "You've reached this limit. It resets at the time shown, or top up your key "
+                 "for extra usage.", window=reason, resets_at=iso(resets))
 
 
 # Sherlock's only window onto the live web. The model can't reach the internet itself; this is the piece that does,
@@ -234,11 +234,11 @@ def add_note(payload):
 def panel(k, raw):
     name, multiplier = PLAN_INFO[k.plan]
     windows, balance = [], None
-    if k.plan == "payg":
+    if k.plan == "payg" or k.balance_cap or k.balance_micros:   # a plan key shows its credit too (extra usage)
         cap = max(k.balance_cap, k.balance_micros) or 1          # the tank; never 0, and never below what's left
         spent = min(100.0, max(0.0, round(100 * (cap - k.balance_micros) / cap, 1)))
         balance = {"currency": "USD", "minor": k.balance_micros // 10_000, "used_percent": spent}
-    else:
+    if k.plan != "payg":
         limits = meter.PLANS[k.plan]
         pct = lambda used, limit: min(100.0, round(100 * used / limit, 1))  # percent only: limits stay private
         windows = [

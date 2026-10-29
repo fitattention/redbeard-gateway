@@ -130,13 +130,11 @@ async def create(request: Request):
     existing = store.get(g.conn(), key_hash)
     if existing and existing.revoked:
         return g.error(400, "key_revoked", "This key can't be renewed.")
+    # Any key can take either: a plan on a pay-as-you-go key keeps its credit as extra usage, and a top-up on a plan
+    # key adds extra usage (meter.blocked: the plan pays first, the credit when the plan can't).
     if plan in PRICES:
-        if existing and existing.plan == "payg":
-            return g.error(409, "wrong_kind", "Pay-as-you-go keys are topped up, not put on a plan.")
         kind, cents = "plan", PRICES[plan]
     elif plan == "payg":
-        if existing and existing.plan != "payg":
-            return g.error(409, "wrong_kind", "Plan keys are renewed, not topped up.")
         try:
             cents = round(float(body.get("amount_usd")) * 100)
         except (TypeError, ValueError):
