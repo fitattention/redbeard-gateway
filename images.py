@@ -5,7 +5,7 @@ import re
 import struct
 import json
 
-MAX_IMAGES = 5
+MAX_IMAGES = 20
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_PIXELS = 12_000_000
@@ -74,7 +74,7 @@ def validate(payload, details=None):
                 continue
             count += 1
             if count > MAX_IMAGES:
-                return 'too_many_images', 'Use at most 5 images in one conversation request.'
+                return 'too_many_images', f'Use at most {MAX_IMAGES} images in one conversation request.'
             image = part.get('image_url')
             url = image.get('url') if isinstance(image, dict) else None
             if not isinstance(url, str):

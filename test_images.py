@@ -19,8 +19,8 @@ class ImageValidationTests(unittest.TestCase):
         self.assertIsNone(images.validate({'messages': [{'role': 'user', 'content': 'text'}]}))
 
     def test_attached_png_and_limit(self):
-        self.assertIsNone(images.validate(payload(count=5)))
-        self.assertEqual(images.validate(payload(count=6))[0], 'too_many_images')
+        self.assertIsNone(images.validate(payload(count=images.MAX_IMAGES)))
+        self.assertEqual(images.validate(payload(count=images.MAX_IMAGES + 1))[0], 'too_many_images')
 
     def test_remote_sources_are_not_fetched(self):
         value = payload(); value['messages'][0]['content'][0]['image_url']['url'] = 'http://169.254.169.254/image'
