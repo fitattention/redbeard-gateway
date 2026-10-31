@@ -13,6 +13,7 @@ KEY is the customer's key (rb_...) or its 64-character fingerprint. Keys file: R
 """
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import meter
@@ -41,6 +42,8 @@ def find(conn, key):
 def describe(k):
     if k.plan == "payg":
         return f"plan payg, balance ${k.balance_micros / 1_000_000:.2f}, revoked {bool(k.revoked)}"
+    k = replace(k)  # a copy with ended windows emptied: the stored counters of an old week are not "this week"
+    meter.refresh(k, int(time.time()))
     return (f"plan {k.plan}, paid until {when(k.paid_until)}, used {k.fh_used:,} in this 5-hour window, "
             f"{k.wk_used:,} this week, revoked {bool(k.revoked)}"
             + (f", extra usage ${k.balance_micros / 1_000_000:.2f}" if k.balance_cap or k.balance_micros else ""))

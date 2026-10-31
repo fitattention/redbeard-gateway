@@ -888,6 +888,11 @@ def test_admin():
     assert store.get(conn, k.key_hash).paid_until == first + 30 * DAY                 # stacks
     admin.main(["revoke", k.key_hash], conn)                                          # by fingerprint too
     assert store.get(conn, k.key_hash).revoked == 1
+    old = store.get(conn, k.key_hash)                                                 # counters from a week ago
+    old.fh_start, old.fh_used, old.wk_start, old.wk_used = int(time.time()) - 8 * DAY, 2_000, int(time.time()) - 8 * DAY, 4_000
+    store.put(conn, old)
+    assert "used 0 in this 5-hour window, 0 this week" in admin.main(["show", k.key_hash], conn)
+    assert store.get(conn, k.key_hash).wk_used == 4_000                              # shown on a copy: nothing stored
     raw_s = admin.main(["new", "starter"], conn).splitlines()[0]
     out = admin.main(["topup", raw_s, "3"], conn)                                      # a plan key + extra usage
     assert store.get(conn, store.hash_key(raw_s)).balance_micros == 3_000_000 and "extra usage $3.00" in out
@@ -901,6 +906,54 @@ def test_admin():
             raise AssertionError(f"accepted {bad}")
         except ValueError:
             pass
+
+
+def test_books():
+    """R&D until the operating start; then sherlock/watson boxes are the cost of running and the rest stays R&D."""
+    import os
+    from math import ceil
+    import backoffice
+    now = calendar.timegm((2026, 11, 20, 12, 0, 0))
+    bill = {"ok": True, "deposited_30d": 100.0, "spent_by_day_label": {
+        "2026-10-10": {"test-a": 20.0, "sherlock": 30.0, "side-x": 5.0},
+        "2026-11-05": {"sherlock": 40.0, "bench": 10.0}, "2026-11-15": {"sherlock-2": 50.0}}}
+    sales = [{"status": "complete", "usd": 50.0, "plan": "starter", "paid_at": "2026-11-10T00:00:00Z", "created": None},
+             {"status": "complete", "usd": 5.0, "plan": "payg", "paid_at": "2026-11-12T00:00:00Z", "created": None},
+             {"status": "expired", "usd": 100.0, "plan": "power", "paid_at": None, "created": "2026-11-11T00:00:00Z"}]
+    monthly = {"2026-10": {"upstream_micros": 2_000_000}}                               # $2 of outside AI, before the box
+    hourly, backoffice.GPU_HOURLY = backoffice.GPU_HOURLY, 2.0
+    try:
+        b = backoffice.statement(bill, sales, monthly, now, {"operating_start": None, "monthly_costs": [], "other_projects": ("side",)})
+        rows = {r["month"]: r for r in b["months"]}
+        assert b["stage"] == "building" and b["rnd_total_usd"] == 152.0 and b["left_out_usd"] == 5.0  # all of it R&D
+        assert rows["2026-11"] == {"month": "2026-11", "revenue_usd": 55.0, "running_usd": 0.0, "gross_usd": 55.0,
+                                   "gross_margin_pct": 100.0, "fixed_usd": 0.0, "operating_usd": 55.0, "rnd_usd": 100.0,
+                                   "net_usd": -45.0}, rows["2026-11"]
+        settings = {"operating_start": "2026-11-01", "monthly_costs": [{"name": "server", "usd": 68.0, "from": "2026-11-03"}],
+                    "other_projects": ("side",)}
+        b = backoffice.statement(bill, sales, monthly, now, settings)
+        rows = {r["month"]: r for r in b["months"]}
+        assert b["stage"] == "running" and rows["2026-10"]["rnd_usd"] == 52.0 and rows["2026-10"]["running_usd"] == 0.0
+        assert (rows["2026-11"]["running_usd"], rows["2026-11"]["rnd_usd"], rows["2026-11"]["fixed_usd"]) == (90.0, 10.0, 68.0)
+        assert (rows["2026-11"]["gross_usd"], rows["2026-11"]["operating_usd"], rows["2026-11"]["net_usd"]) == (-35.0, -103.0, -113.0)
+        d = b["last_30d"]
+        assert (d["mrr_usd"], d["arr_usd"], d["payg_usd"], d["paying_customers"], d["arpu_usd"]) == (50.0, 600.0, 5.0, 1, 50.0)
+        assert (d["running_usd"], d["rnd_usd"], d["operating_usd"], d["cash_flow_usd"]) == (90.0, 10.0, -103.0, -113.0)
+        assert b["rnd_payback_months"] is None and b["monthly_run_cost_usd"] == 1508.0              # no profit: no payback
+        assert b["break_even_customers"]["starter"] == ceil(1508 / 50)
+        b = backoffice.statement({"connected": True, "ok": False}, None, {}, now, settings)    # nothing readable
+        assert b["rnd_total_usd"] is None and all(r["revenue_usd"] is None and r["net_usd"] is None for r in b["months"])
+        os.environ["REDBEARD_BOOKS"] = json.dumps({"operating_start": "soon", "other_projects": ["side"],
+                                                   "monthly_costs": [{"name": "vds", "usd": 68, "from": "2026-11-03"},
+                                                                     {"name": "no date", "usd": 9}, "junk"]})
+        s = backoffice.book_settings()
+        assert s == {"operating_start": None, "other_projects": ("side",),
+                     "monthly_costs": [{"name": "vds", "usd": 68.0, "from": "2026-11-03"}]}, s
+        os.environ["REDBEARD_BOOKS"] = "not json"
+        assert backoffice.book_settings()["operating_start"] is None                       # broken settings: building
+    finally:
+        backoffice.GPU_HOURLY = hourly
+        os.environ.pop("REDBEARD_BOOKS", None)
 
 
 def test_backoffice_extra_usage():

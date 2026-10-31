@@ -15,12 +15,15 @@ of this public code; it holds only the owner's own costs, never anything about c
 import asyncio
 import hashlib
 import hmac
+import json
 import os
+import re
 import time
 from collections import Counter
 from math import ceil
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from statistics import median
 
 import httpx
@@ -48,6 +51,7 @@ RPC = {"bnb": "https://bsc-rpc.publicnode.com", "matic": "https://polygon-bor-rp
        "eth": "https://ethereum-rpc.publicnode.com"}
 TRONGRID = "https://api.trongrid.io/v1/accounts/"
 DAY = 86400
+PRODUCT_BOXES = ("sherlock", "watson")  # boxes that serve customers, by their label at the GPU provider
 _wallets = (0.0, [])  # (when read, rows): public chains are asked at most every two minutes
 
 
@@ -271,6 +275,94 @@ def accounts(sales, bill, monthly, key_rows, hourly, cost_30d, now):
                            "sales_needed": {p: ceil(box_month / (c / 100)) for p, c in checkout.PRICES.items()} if GPU_HOURLY else None}}
 
 
+def book_settings():
+    """The owner's private book settings: books.json beside this file, or REDBEARD_BOOKS (JSON). Read on every look,
+    so a change needs no restart. operating_start: "YYYY-MM-DD", the day the service began running on a box rented by
+    the month; until it is set, every GPU dollar is research and development. monthly_costs: [{"name", "usd",
+    "from": "YYYY-MM-DD"}], fixed costs such as a server, counted for every month from the one they start in.
+    other_projects: label prefixes of GPU boxes that belong to the owner's other work, left out of these books."""
+    try:
+        raw = os.environ.get("REDBEARD_BOOKS") or Path(__file__).with_name("books.json").read_text(encoding="utf-8")
+        cfg = json.loads(raw)
+    except (OSError, ValueError):
+        cfg = {}
+    day = lambda v: v if isinstance(v, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", v) else None
+    costs = [{"name": str(c.get("name") or "cost"), "usd": float(c["usd"]), "from": day(c.get("from"))}
+             for c in cfg.get("monthly_costs") or [] if isinstance(c, dict) and isinstance(c.get("usd"), (int, float))]
+    return {"operating_start": day(cfg.get("operating_start")), "monthly_costs": [c for c in costs if c["from"]],
+            "other_projects": tuple(str(p) for p in cfg.get("other_projects") or [] if p)}
+
+
+def statement(bill, sales, monthly, now, settings):
+    """The business's books, by UTC month, on a cash basis. Every GPU dollar is research and development (R&D) until
+    the operating start; from that day, boxes labelled sherlock or watson are the cost of running the service and every
+    other box is still R&D. The outside AI used before our own box is R&D too. Fixed monthly costs come from the
+    settings; anything no record can see is listed in the page as "not in these books". None means unknown, never 0."""
+    month_of = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m")
+    start, other = settings["operating_start"], settings["other_projects"]
+    days = bill.get("spent_by_day_label") if bill and bill.get("ok") else None
+    since_30d = datetime.fromtimestamp(now - 30 * DAY, timezone.utc).strftime("%Y-%m-%d")
+    rnd, running, left_out, rnd_30d, running_30d = Counter(), Counter(), Counter(), 0.0, 0.0
+    for day, labels in (days or {}).items():
+        for label, usd in labels.items():
+            if other and label.startswith(other):
+                left_out[day[:7]] += usd
+            elif start and day >= start and label.startswith(PRODUCT_BOXES):
+                running[day[:7]] += usd
+                running_30d += usd if day >= since_30d else 0
+            else:
+                rnd[day[:7]] += usd
+                rnd_30d += usd if day >= since_30d else 0
+    for m, row in monthly.items():
+        rnd[m] += (row.get("upstream_micros") or 0) / 1e6
+    paid = [s for s in sales or [] if s["status"] == "complete"]
+    sold = Counter()
+    for s in paid:
+        sold[month_of(ts(s["paid_at"] or s["created"]))] += s["usd"]
+    fixed = lambda m: sum(c["usd"] for c in settings["monthly_costs"] if c["from"][:7] <= m)
+    gpu_known, sales_known = days is not None, sales is not None
+    known = lambda v, ok: round(v, 2) if ok else None
+    sub = lambda a, b: round(a - b, 2) if a is not None and b is not None else None
+    rows = []
+    for m in sorted({*rnd, *running, *sold, month_of(now)} - {""}, reverse=True):
+        revenue, cost = known(sold[m], sales_known), known(running[m], gpu_known)
+        gross = sub(revenue, cost)
+        operating = sub(gross, fixed(m))
+        r_and_d = known(rnd[m], gpu_known)
+        rows.append({"month": m, "revenue_usd": revenue, "running_usd": cost, "gross_usd": gross,
+                     "gross_margin_pct": round(100 * gross / revenue, 1) if gross is not None and revenue else None,
+                     "fixed_usd": round(fixed(m), 2), "operating_usd": operating, "rnd_usd": r_and_d,
+                     "net_usd": sub(operating, r_and_d)})
+    plan_30d = [s for s in paid if s["plan"] != "payg" and ts(s["paid_at"] or s["created"]) >= now - 30 * DAY]
+    payg_30d = sum(s["usd"] for s in paid if s["plan"] == "payg" and ts(s["paid_at"] or s["created"]) >= now - 30 * DAY)
+    mrr = sum(s["usd"] for s in plan_30d)
+    revenue_30d = mrr + payg_30d
+    fixed_now = fixed(month_of(now))
+    gross_30d = round(revenue_30d - running_30d, 2) if sales_known and gpu_known else None
+    profit_30d = round(gross_30d - fixed_now, 2) if gross_30d is not None else None
+    rnd_total = round(sum(rnd.values()), 2) if gpu_known else None
+    box_month = GPU_HOURLY * 24 * 30
+    deposited = bill.get("deposited_30d") if bill and bill.get("ok") else None
+    return {
+        "stage": "running" if start else "building", "operating_start": start, "basis": "cash",
+        "monthly_costs": settings["monthly_costs"], "months": rows,
+        "left_out_usd": round(sum(left_out.values()), 2) if gpu_known else None,
+        "rnd_total_usd": rnd_total, "rnd_months": sum(1 for v in rnd.values() if v > 0) if gpu_known else None,
+        "last_30d": {
+            "revenue_usd": round(revenue_30d, 2) if sales_known else None, "mrr_usd": round(mrr, 2) if sales_known else None,
+            "arr_usd": round(12 * mrr, 2) if sales_known else None, "payg_usd": round(payg_30d, 2) if sales_known else None,
+            "paying_customers": len(plan_30d) if sales_known else None,
+            "arpu_usd": round(mrr / len(plan_30d), 2) if sales_known and plan_30d else None,
+            "running_usd": round(running_30d, 2) if gpu_known else None, "rnd_usd": round(rnd_30d, 2) if gpu_known else None,
+            "gross_usd": gross_30d, "gross_margin_pct": round(100 * gross_30d / revenue_30d, 1) if gross_30d is not None and revenue_30d else None,
+            "fixed_usd": round(fixed_now, 2), "operating_usd": profit_30d,
+            "cash_flow_usd": round(revenue_30d - deposited - fixed_now, 2) if deposited is not None and sales_known else None},
+        "monthly_run_cost_usd": round(box_month + fixed_now, 2) if GPU_HOURLY else None,
+        "break_even_customers": {p: ceil((box_month + fixed_now) / (c / 100)) for p, c in checkout.PRICES.items()} if GPU_HOURLY else None,
+        "rnd_payback_months": round(rnd_total / profit_30d, 1) if rnd_total is not None and profit_30d and profit_30d > 0 else None,
+    }
+
+
 def download_totals(rows, now):
     """App downloads (stats.downloads rows) per file for the last 24 hours, 7 and 30 days and all kept, and per
     UTC day for the last 30 days. Counts only: the table holds no visitor detail."""
@@ -316,14 +408,15 @@ async def overview(door: str, request: Request):
     bill = await gpu_bill.read(now) if gpu_bill else {"connected": False}
     hours = gpu_hours(month)
     totals = summary(sales, key_rows, hourly, hours, now, bill.get("spent_30d") if bill.get("ok") else None)
+    monthly = stats.monthly(stats.hour_of(now - stats.KEEP_DAYS * DAY))
     return {"generated": g.iso(now),
             "settings": {"gpu_hourly": GPU_HOURLY or None, "speed_bar": stats.SPEED_BAR,
                          "prices": {p: c / 100 for p, c in checkout.PRICES.items()}},
             "health": {"model": await g.reachable(g.UPSTREAMS[names[0]]) if names else False,
                        "bitcart": sales is not None, "gpu_bill": bill.get("ok") if bill["connected"] else None},
             "summary": totals,
-            "accounts": accounts(sales, bill, stats.monthly(stats.hour_of(now - stats.KEEP_DAYS * DAY)), key_rows, hourly,
-                                 totals["gpu"]["cost_30d"], now),
+            "accounts": accounts(sales, bill, monthly, key_rows, hourly, totals["gpu"]["cost_30d"], now),
+            "books": statement(bill, sales, monthly, now, book_settings()),
             "gpu_bill": bill,
             "sales": sales[:300] if sales is not None else None,
             "wallets": await wallets(raw[0] if raw else None) if raw is not None else None,
