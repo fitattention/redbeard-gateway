@@ -280,7 +280,8 @@ def book_settings():
     so a change needs no restart. operating_start: "YYYY-MM-DD", the day the service began running on a box rented by
     the month; until it is set, every GPU dollar is research and development. monthly_costs: [{"name", "usd",
     "from": "YYYY-MM-DD"}], fixed costs such as a server, counted for every month from the one they start in.
-    other_projects: label prefixes of GPU boxes that belong to the owner's other work, left out of these books."""
+    other_projects: label prefixes of GPU boxes that belong to the owner's other work, left out of these books.
+    books_begin: "YYYY-MM-DD", the day this business's work began; GPU spending before it was other work, left out."""
     try:
         raw = os.environ.get("REDBEARD_BOOKS") or Path(__file__).with_name("books.json").read_text(encoding="utf-8")
         cfg = json.loads(raw)
@@ -290,7 +291,8 @@ def book_settings():
     costs = [{"name": str(c.get("name") or "cost"), "usd": float(c["usd"]), "from": day(c.get("from"))}
              for c in cfg.get("monthly_costs") or [] if isinstance(c, dict) and isinstance(c.get("usd"), (int, float))]
     return {"operating_start": day(cfg.get("operating_start")), "monthly_costs": [c for c in costs if c["from"]],
-            "other_projects": tuple(str(p) for p in cfg.get("other_projects") or [] if p)}
+            "other_projects": tuple(str(p) for p in cfg.get("other_projects") or [] if p),
+            "books_begin": day(cfg.get("books_begin"))}
 
 
 def statement(bill, sales, monthly, now, settings):
@@ -299,13 +301,13 @@ def statement(bill, sales, monthly, now, settings):
     other box is still R&D. The outside AI used before our own box is R&D too. Fixed monthly costs come from the
     settings; anything no record can see is listed in the page as "not in these books". None means unknown, never 0."""
     month_of = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m")
-    start, other = settings["operating_start"], settings["other_projects"]
+    start, other, begin = settings["operating_start"], settings["other_projects"], settings.get("books_begin")
     days = bill.get("spent_by_day_label") if bill and bill.get("ok") else None
     since_30d = datetime.fromtimestamp(now - 30 * DAY, timezone.utc).strftime("%Y-%m-%d")
     rnd, running, left_out, rnd_30d, running_30d = Counter(), Counter(), Counter(), 0.0, 0.0
     for day, labels in (days or {}).items():
         for label, usd in labels.items():
-            if other and label.startswith(other):
+            if (other and label.startswith(other)) or (begin and day < begin):  # other work: not this business
                 left_out[day[:7]] += usd
             elif start and day >= start and label.startswith(PRODUCT_BOXES):
                 running[day[:7]] += usd
@@ -314,7 +316,8 @@ def statement(bill, sales, monthly, now, settings):
                 rnd[day[:7]] += usd
                 rnd_30d += usd if day >= since_30d else 0
     for m, row in monthly.items():
-        rnd[m] += (row.get("upstream_micros") or 0) / 1e6
+        if not begin or m >= begin[:7]:
+            rnd[m] += (row.get("upstream_micros") or 0) / 1e6
     paid = [s for s in sales or [] if s["status"] == "complete"]
     sold = Counter()
     for s in paid:

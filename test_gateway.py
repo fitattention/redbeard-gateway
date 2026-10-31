@@ -943,11 +943,15 @@ def test_books():
         assert b["break_even_customers"]["starter"] == ceil(1508 / 50)
         b = backoffice.statement({"connected": True, "ok": False}, None, {}, now, settings)    # nothing readable
         assert b["rnd_total_usd"] is None and all(r["revenue_usd"] is None and r["net_usd"] is None for r in b["months"])
+        late = {"operating_start": None, "monthly_costs": [], "other_projects": ("side",), "books_begin": "2026-11-01"}
+        b = backoffice.statement(bill, sales, monthly, now, late)                          # work before it was other work
+        assert b["rnd_total_usd"] == 100.0 and b["left_out_usd"] == 55.0 and "2026-10" not in {r["month"] for r in b["months"]}
         os.environ["REDBEARD_BOOKS"] = json.dumps({"operating_start": "soon", "other_projects": ["side"],
                                                    "monthly_costs": [{"name": "vds", "usd": 68, "from": "2026-11-03"},
-                                                                     {"name": "no date", "usd": 9}, "junk"]})
+                                                                     {"name": "no date", "usd": 9}, "junk"],
+                                                   "books_begin": "2026-10-01"})
         s = backoffice.book_settings()
-        assert s == {"operating_start": None, "other_projects": ("side",),
+        assert s == {"operating_start": None, "other_projects": ("side",), "books_begin": "2026-10-01",
                      "monthly_costs": [{"name": "vds", "usd": 68.0, "from": "2026-11-03"}]}, s
         os.environ["REDBEARD_BOOKS"] = "not json"
         assert backoffice.book_settings()["operating_start"] is None                       # broken settings: building
