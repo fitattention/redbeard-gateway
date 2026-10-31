@@ -569,7 +569,7 @@ async def chat(request: Request):
             except (ValueError, AttributeError):
                 u = {}
             settle(k.key_hash, u.get("prompt_tokens"), u.get("completion_tokens"), cache_read(u))
-            stats.finish(k.plan, src, u.get("prompt_tokens"), u.get("completion_tokens"))
+            stats.finish(k.plan, src, u.get("prompt_tokens"), u.get("completion_tokens"), cached=cache_read(u))
         else:
             stats.add(k.plan, src, failed=1)
         return Response(content, status_code=upstream.status_code, media_type="application/json")
@@ -604,7 +604,8 @@ async def chat(request: Request):
             waited, writing = (first - began, done - first) if first else (None, None)
             if found:
                 settle(k.key_hash, found.get("prompt_tokens"), found.get("completion_tokens"), cache_read(found))
-                stats.finish(k.plan, src, found.get("prompt_tokens"), found.get("completion_tokens"), waited, writing)
+                stats.finish(k.plan, src, found.get("prompt_tokens"), found.get("completion_tokens"), waited, writing,
+                             cached=cache_read(found))
             else:
                 # ponytail: no usage line (the customer left mid-reply): charge the pieces streamed plus a
                 # prompt estimate of 4 bytes a token. Rough on purpose; exact needs the kitchen's own count.

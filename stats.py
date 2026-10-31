@@ -19,7 +19,8 @@ MIN_FOR_SPEED = 20      # replies shorter than this give no fair speed reading
 STALE = 900             # a reply open longer than the gateway's read timeout is gone, whatever happened to it
 COUNTS = ("requests", "prompt_tokens", "completion_tokens", "gen_tokens", "gen_ms", "timed", "wait_ms", "waited", "slow",
           "cut", "failed", "limit_5h", "limit_week", "expired", "empty", "searches", "fetches", "upstream_micros",
-          "offline")  # offline: someone asked while the model server wasn't reachable (counted in failed too)
+          "offline", "cached_tokens")  # offline: someone asked while the model server wasn't reachable (counted in
+# failed too); cached_tokens: the part of prompt_tokens the model re-read from its cache (zero for hours before it)
 REFUSAL = {"five_hour": "limit_5h", "weekly": "limit_week", "expired": "expired", "balance": "empty"}
 
 _db = None
@@ -99,10 +100,12 @@ def end(ticket):
     _open.pop(ticket, None)
 
 
-def finish(plan, src, prompt, completion, waited=None, writing=None, cut=False, now=None):
-    """One reply done. waited: seconds to its first piece; writing: seconds from the first piece to the end."""
+def finish(plan, src, prompt, completion, waited=None, writing=None, cut=False, now=None, cached=0):
+    """One reply done. waited: seconds to its first piece; writing: seconds from the first piece to the end;
+    cached: how much of prompt the model re-read from its cache."""
     prompt, completion = max(0, int(prompt or 0)), max(0, int(completion or 0))
-    c = {"requests": 1, "prompt_tokens": prompt, "completion_tokens": completion, "cut": int(cut)}
+    c = {"requests": 1, "prompt_tokens": prompt, "completion_tokens": completion, "cut": int(cut),
+         "cached_tokens": min(prompt, max(0, int(cached or 0)))}
     if waited is not None:
         c.update(wait_ms=round(waited * 1000), waited=1)
     if writing and writing > 0 and completion >= MIN_FOR_SPEED and not cut:

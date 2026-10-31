@@ -211,7 +211,7 @@ def summary(sales, key_rows, hourly, hours, now, spent=None):
                       for name, days in (("24h", 1), ("7d", 7), ("30d", 30))}
     used = Counter()
     for r in hourly:
-        used[r["plan"]] += meter.counted(r["prompt_tokens"], r["completion_tokens"])
+        used[r["plan"]] += meter.counted(r["prompt_tokens"], r["completion_tokens"], r["cached_tokens"])
     total = sum(used.values())
     out["plans"] = {p: {"active_keys": active[p], "tokens_30d": used[p],
                         "revenue_30d": round(sum(s["usd"] for s in paid if s["plan"] == p and ts(s["paid_at"] or s["created"]) >= month), 2)

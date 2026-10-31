@@ -323,6 +323,7 @@ def test_stats():
                 by = {(r["plan"], r["source"]): r for r in hourly}
                 api, chat = by[("power", "api")], by[("power", "chat")]
                 assert (api["requests"], api["prompt_tokens"], api["completion_tokens"], api["limit_5h"]) == (1, 80, 5, 1)
+                assert api["cached_tokens"] == 60                                # the remembered part, for the books
                 assert (chat["requests"], chat["completion_tokens"], chat["waited"], chat["cut"]) == (1, 2, 1, 0)
                 assert chat["searches"] == 1 and chat["gen_tokens"] == 0          # 2 tokens: too short for a speed
                 assert by[("max", "api")]["expired"] == 1 and by[("max", "api")]["requests"] == 0
