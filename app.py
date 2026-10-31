@@ -205,15 +205,22 @@ async def fetch_page(url: str, limit_chars: int | None = PAGE_CHARS) -> str:
     return text if limit_chars is None else text[:limit_chars]
 
 
-def settle(key_hash, prompt_tokens, completion_tokens):
+def settle(key_hash, prompt_tokens, completion_tokens, cached_tokens=0):
     """Charge a finished reply. Synchronous on purpose (see the top of the file)."""
     k = store.get(conn(), key_hash)
     if k is None:
         return
     now = int(time.time())
     meter.refresh(k, now)
-    meter.charge(k, max(0, int(prompt_tokens or 0)), max(0, int(completion_tokens or 0)), now)
+    meter.charge(k, max(0, int(prompt_tokens or 0)), max(0, int(completion_tokens or 0)), now,
+                 max(0, int(cached_tokens or 0)))
     store.put(conn(), k)
+
+
+def cache_read(usage):
+    """The part of the prompt the model re-read from its cache (vLLM --enable-prompt-tokens-details), else 0."""
+    details = usage.get("prompt_tokens_details")
+    return details.get("cached_tokens") if isinstance(details, dict) else 0
 
 
 def seed(name):
@@ -561,7 +568,7 @@ async def chat(request: Request):
                 u = json.loads(content).get("usage") or {}
             except (ValueError, AttributeError):
                 u = {}
-            settle(k.key_hash, u.get("prompt_tokens"), u.get("completion_tokens"))
+            settle(k.key_hash, u.get("prompt_tokens"), u.get("completion_tokens"), cache_read(u))
             stats.finish(k.plan, src, u.get("prompt_tokens"), u.get("completion_tokens"))
         else:
             stats.add(k.plan, src, failed=1)
@@ -596,7 +603,7 @@ async def chat(request: Request):
             stats.end(ticket)
             waited, writing = (first - began, done - first) if first else (None, None)
             if found:
-                settle(k.key_hash, found.get("prompt_tokens"), found.get("completion_tokens"))
+                settle(k.key_hash, found.get("prompt_tokens"), found.get("completion_tokens"), cache_read(found))
                 stats.finish(k.plan, src, found.get("prompt_tokens"), found.get("completion_tokens"), waited, writing)
             else:
                 # ponytail: no usage line (the customer left mid-reply): charge the pieces streamed plus a

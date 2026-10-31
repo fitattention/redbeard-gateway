@@ -31,9 +31,14 @@ def _load_plans():
 PLANS = _load_plans()
 FIVE_HOURS = 5 * 3600
 DAYS_PER_PAYMENT = 30
-READ_DIVISOR = 8          # a token read counts 1/8 of a token written (API.md starting rule)
-WRITE_MICROS = 10         # pay-as-you-go: $10 per million written = 10 millionths of a dollar each
-READ_MICROS = 1           # pay-as-you-go: $1 per million read
+# Pay-as-you-go prices in millionths of a dollar per MILLION tokens: $5 written, $0.50 read, $0.05 re-read from the
+# model's cache (prompt_tokens_details.cached_tokens: text it already holds costs it almost nothing to read again).
+WRITE_PER_M = 5_000_000
+READ_PER_M = 500_000
+CACHED_PER_M = 50_000
+# Plans count tokens with the same weights as those prices, so a plan's allowance is worth the same work in any mix.
+READ_DIVISOR = WRITE_PER_M // READ_PER_M        # 10: a token read counts 1/10 of a token written
+CACHED_DIVISOR = WRITE_PER_M // CACHED_PER_M    # 100: a token re-read from the cache counts 1/100
 
 
 def week_start(now: int) -> int:
@@ -72,18 +77,27 @@ def blocked(key, now: int):
     return None if stop is None or key.balance_micros > 0 else stop
 
 
-def counted(prompt_tokens: int, completion_tokens: int) -> int:
-    return completion_tokens + prompt_tokens // READ_DIVISOR
+def counted(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> int:
+    """A reply in plan units (one unit = one token written). cached_tokens is the part of prompt_tokens re-read."""
+    cached = min(cached_tokens, prompt_tokens)
+    return completion_tokens + (prompt_tokens - cached) // READ_DIVISOR + cached // CACHED_DIVISOR
 
 
-def charge(key, prompt_tokens: int, completion_tokens: int, now: int) -> None:
+def price_micros(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -> int:
+    """A reply's pay-as-you-go price in millionths of a dollar, rounded up."""
+    cached = min(cached_tokens, prompt_tokens)
+    total = completion_tokens * WRITE_PER_M + (prompt_tokens - cached) * READ_PER_M + cached * CACHED_PER_M
+    return -(-total // 1_000_000)
+
+
+def charge(key, prompt_tokens: int, completion_tokens: int, now: int, cached_tokens: int = 0) -> None:
     """Add a finished reply to the key: the plan's counters while the plan can pay, else money off the credit."""
     if plan_stop(key, now) is not None:
-        key.balance_micros -= completion_tokens * WRITE_MICROS + prompt_tokens * READ_MICROS
+        key.balance_micros -= price_micros(prompt_tokens, completion_tokens, cached_tokens)
         return
     if key.fh_start is None:
         key.fh_start = now  # the 5-hour window starts at first use
-    n = counted(prompt_tokens, completion_tokens)
+    n = counted(prompt_tokens, completion_tokens, cached_tokens)
     key.fh_used += n
     key.wk_used += n
 

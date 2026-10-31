@@ -29,13 +29,14 @@ def test_blocked_and_windows():
     assert meter.blocked(k, now) == ("expired", None)
     k = plan_key()
     assert meter.blocked(k, now) is None
-    meter.charge(k, prompt_tokens=8_000, completion_tokens=299_000, now=now)
-    assert (k.fh_start, k.fh_used, k.wk_used) == (now, 300_000, 300_000)  # 299,000 + 8,000 / 8
+    limits = meter.PLANS["starter"]
+    meter.charge(k, prompt_tokens=8_000, completion_tokens=limits["five_hour"] - 800, now=now)  # 8,000 read = 800
+    assert (k.fh_start, k.fh_used, k.wk_used) == (now, limits["five_hour"], limits["five_hour"])
     assert meter.blocked(k, now + HOUR) == ("five_hour", now + 5 * HOUR)
     meter.refresh(k, now + 5 * HOUR)                                       # window over
-    assert (k.fh_start, k.fh_used, k.wk_used) == (None, 0, 300_000)
+    assert (k.fh_start, k.fh_used, k.wk_used) == (None, 0, limits["five_hour"])
     assert meter.blocked(k, now + 5 * HOUR) is None
-    k.wk_used = 1_300_000
+    k.wk_used = limits["weekly"]
     assert meter.blocked(k, now + 5 * HOUR) == ("weekly", SUN + 7 * DAY)
     meter.refresh(k, SUN + 7 * DAY)                                        # new week
     assert k.wk_used == 0 and meter.blocked(k, SUN + 7 * DAY) is None
@@ -45,7 +46,12 @@ def test_payg():
     k = store.Key(key_hash="x", plan="payg", balance_micros=5_000_000)    # $5
     assert meter.blocked(k, SUN) is None
     meter.charge(k, prompt_tokens=1_000, completion_tokens=100, now=SUN)
-    assert k.balance_micros == 5_000_000 - 100 * 10 - 1_000 * 1
+    assert k.balance_micros == 5_000_000 - 100 * 5 - 1_000 // 2               # $5 per million written, $0.50 read
+    meter.charge(k, prompt_tokens=1_000_000, completion_tokens=0, now=SUN, cached_tokens=1_000_000)
+    assert k.balance_micros == 5_000_000 - 1_000 - 50_000                   # re-read from the cache: $0.05 a million
+    meter.charge(k, prompt_tokens=1, completion_tokens=0, now=SUN)
+    assert k.balance_micros == 5_000_000 - 51_000 - 1                       # half a millionth rounds up, never down
+    assert meter.counted(100, 10, cached_tokens=500) == 10 + 100 // 100    # more cached than read: capped at read
     assert (k.fh_used, k.wk_used) == (0, 0)                                # pay-as-you-go has no windows
     k.balance_micros = 0
     assert meter.blocked(k, SUN) == ("balance", None)
@@ -57,12 +63,12 @@ def test_extra_usage():
     k = plan_key()
     k.balance_micros = k.balance_cap = 3_000_000                           # a Starter key holding $3 of credit
     meter.charge(k, prompt_tokens=800, completion_tokens=900, now=now)     # within the allowance: the plan pays
-    assert k.balance_micros == 3_000_000 and k.fh_used == 1_000
+    assert k.balance_micros == 3_000_000 and k.fh_used == 980              # 900 + 800 / 10
     k.fh_used = limits["five_hour"]                                        # 5-hour allowance used up
     assert meter.plan_stop(k, now + HOUR) == ("five_hour", now + 5 * HOUR)
     assert meter.blocked(k, now + HOUR) is None                            # ...but the credit carries on
     meter.charge(k, prompt_tokens=1_000, completion_tokens=100, now=now + HOUR)
-    assert k.balance_micros == 3_000_000 - 100 * 10 - 1_000 and k.fh_used == limits["five_hour"]  # credit paid
+    assert k.balance_micros == 3_000_000 - 100 * 5 - 1_000 // 2 and k.fh_used == limits["five_hour"]  # credit paid
     k.balance_micros = 0
     assert meter.blocked(k, now + HOUR) == ("five_hour", now + 5 * HOUR)   # no credit left: wait for the window
     k.balance_micros = -500                                                # a reply that cost more than was left
@@ -72,7 +78,7 @@ def test_extra_usage():
     k.balance_micros = 2_000_000                                           # ...with $2 of credit left: it works
     assert meter.blocked(k, now) is None
     meter.charge(k, prompt_tokens=0, completion_tokens=1_000, now=now)
-    assert k.balance_micros == 2_000_000 - 10_000 and (k.fh_used, k.wk_used) == (0, 0)
+    assert k.balance_micros == 2_000_000 - 5_000 and (k.fh_used, k.wk_used) == (0, 0)
 
 
 def test_extend():
@@ -128,7 +134,8 @@ async def fake_kitchen(request: Request):
     body = await request.json()
     seen.append(body)
     if not body.get("stream"):
-        return {"choices": [{"message": {"content": "Hello"}}], "usage": {"prompt_tokens": 80, "completion_tokens": 5}}
+        return {"choices": [{"message": {"content": "Hello"}}],  # 60 of the 80 read were in the model's cache
+                "usage": {"prompt_tokens": 80, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 60}}}
 
     async def pieces():
         for word in ["Hel", "lo"] + ["."] * (40 if kitchen_mode["slow"] else 0):
@@ -136,7 +143,8 @@ async def fake_kitchen(request: Request):
             await asyncio.sleep(kitchen_mode["slow"])
         if kitchen_mode["usage"] and body.get("stream_options", {}).get("include_usage"):
             written = 1000 if kitchen_mode["slow"] else 2  # big when slow, so a full charge is easy to tell apart
-            yield 'data: {"choices":[],"usage":{"prompt_tokens":80,"completion_tokens":%d}}\n\n' % written
+            yield ('data: {"choices":[],"usage":{"prompt_tokens":80,"completion_tokens":%d,'
+                   '"prompt_tokens_details":{"cached_tokens":60}}}\n\n' % written)
         yield "data: [DONE]\n\n"
     return StreamingResponse(pieces(), media_type="text/event-stream")
 
@@ -187,7 +195,7 @@ async def run_e2e():
 
         r = await gw.post("/v1/chat/completions", json=ask, headers=auth)             # plain reply
         assert r.status_code == 200 and r.json()["choices"][0]["message"]["content"] == "Hello"
-        assert used(h).fh_used == 5 + 80 // 8
+        assert used(h).fh_used == 5 + 20 // 10 + 60 // 100                          # written + read + cache
         note = gateway.NOTE.format(name="Sherlock")                                   # the hidden note + seed
         m = seen[-1]["messages"]
         assert m[0] == {"role": "system", "content": note}                            # note first
@@ -209,7 +217,7 @@ async def run_e2e():
         r = await gw.post("/v1/chat/completions", json={**ask, "stream": True}, headers=auth)
         assert r.status_code == 200 and "Hel" in r.text and '"usage"' in r.text
         assert seen[-1]["stream_options"] == {"include_usage": True}                  # we asked for usage
-        assert used(h).fh_used == 3 * 15 + 2 + 80 // 8                                # 3 plain replies so far
+        assert used(h).fh_used == 3 * 7 + 2 + 2                                      # 3 plain replies so far
 
         kitchen_mode["usage"] = False                                                 # kitchen forgets usage
         before = used(h).fh_used
@@ -240,7 +248,7 @@ async def run_e2e():
 
         raw5, h5 = add_key("payg", balance_micros=5_000_000)                           # pay-as-you-go
         r = await gw.post("/v1/chat/completions", json=ask, headers={"Authorization": f"Bearer {raw5}"})
-        assert r.status_code == 200 and used(h5).balance_micros == 5_000_000 - 5 * 10 - 80
+        assert r.status_code == 200 and used(h5).balance_micros == 5_000_000 - (25 + 10 + 3)  # 5, 20, 60 cached
 
         r = await gw.post("/v1/session", json={"key": raw5})                         # the panel
         assert r.status_code == 200 and r.json()["balance"] == {"currency": "USD", "minor": 499, "used_percent": 0.0}
@@ -250,7 +258,7 @@ async def run_e2e():
         assert r.json()["balance"] == {"currency": "USD", "minor": 200, "used_percent": 60.0}
         k = used(h); k.balance_micros = k.balance_cap = 1_000_000; store.put(gateway.app.state.conn, k)  # + $1 extra
         r = await gw.post("/v1/chat/completions", json=ask, headers=auth)            # 5-hour window still full
-        assert r.status_code == 200 and used(h).balance_micros == 1_000_000 - 5 * 10 - 80
+        assert r.status_code == 200 and used(h).balance_micros == 1_000_000 - (25 + 10 + 3)
         assert used(h).fh_used == meter.PLANS["starter"]["five_hour"]                # the plan's counters untouched
         r = await gw.post("/v1/session", json={"key": raw})                          # the panel: plan AND credit
         assert len(r.json()["windows"]) == 2 and r.json()["balance"]["minor"] == 99
@@ -736,7 +744,7 @@ def test_backoffice():
         for ref, iid, kind, plan, cents in (("od", "d", "plan", "max", 20000), ("oc", "c", "plan", "starter", 5000)):
             conn.execute("INSERT INTO orders (order_id, key_hash, kind, plan, cents, invoice_id, created) VALUES"
                          " (?, ?, ?, ?, ?, ?, ?)", (ref, "f" * 64, kind, plan, cents, iid, int(now)))
-        stats.add("power", "api", prompt_tokens=800, completion_tokens=900)              # counts 1,000
+        stats.add("power", "api", prompt_tokens=1_000, completion_tokens=900)            # counts 1,000
         stats.add("max", "chat", completion_tokens=3000)                                 # counts 3,000
         stats.add("max", "chat", failed=1, offline=1)                                    # asked while the model was off
         backoffice.gpu_bill = None                                                       # no private bill reader yet
@@ -798,7 +806,7 @@ def test_backoffice():
             assert all(r["gpu_usd"] is None and r["profit_usd"] is None for r in a_["months"])  # no bill: unknown, never 0
             unearned = 100 * (30 - (2 * DAY - 120) / DAY) / 30 + 50 * (30 - (2 * HOUR - 600) / DAY) / 30  # the payg sale owes no time
             assert abs(a_["owed"]["unearned_plans_usd"] - unearned) < 0.05 and a_["owed"]["prepaid_balances_usd"] == 4.99
-            assert a_["unit_30d"]["tokens"] == 4700 and a_["unit_30d"]["cost_per_million_tokens_usd"] == round(2.0 / 4700 * 1e6, 2)
+            assert a_["unit_30d"]["tokens"] == 4900 and a_["unit_30d"]["cost_per_million_tokens_usd"] == round(2.0 / 4900 * 1e6, 2)
             assert a_["unit_30d"]["cost_per_reply_usd"] is None                          # no replies counted: no ratio
             assert a_["unit_30d"]["busy_hours"] == 0 and a_["unit_30d"]["clock_hours"] == 720  # one unit on both sides
             assert a_["break_even"] == {"box_month_usd": 1440.0,
