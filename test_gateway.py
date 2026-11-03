@@ -927,8 +927,8 @@ def test_books():
         rows = {r["month"]: r for r in b["months"]}
         assert b["stage"] == "building" and b["rnd_total_usd"] == 152.0 and b["left_out_usd"] == 5.0  # all of it R&D
         assert rows["2026-11"] == {"month": "2026-11", "revenue_usd": 55.0, "running_usd": 0.0, "gross_usd": 55.0,
-                                   "gross_margin_pct": 100.0, "fixed_usd": 0.0, "operating_usd": 55.0, "rnd_usd": 100.0,
-                                   "net_usd": -45.0}, rows["2026-11"]
+                                   "gross_margin_pct": 100.0, "fixed_usd": 0.0, "advertising_usd": 0.0, "operating_usd": 55.0,
+                                   "rnd_usd": 100.0, "net_usd": -45.0}, rows["2026-11"]
         settings = {"operating_start": "2026-11-01", "monthly_costs": [{"name": "server", "usd": 68.0, "from": "2026-11-03"}],
                     "other_projects": ("side",)}
         b = backoffice.statement(bill, sales, monthly, now, settings)
@@ -946,13 +946,28 @@ def test_books():
         late = {"operating_start": None, "monthly_costs": [], "other_projects": ("side",), "books_begin": "2026-11-01"}
         b = backoffice.statement(bill, sales, monthly, now, late)                          # work before it was other work
         assert b["rnd_total_usd"] == 100.0 and b["left_out_usd"] == 55.0 and "2026-10" not in {r["month"] for r in b["months"]}
+        b = backoffice.statement(bill, sales, monthly, now, dict(late, advertising=[{"name": "x", "usd": 5.0, "day": "2026-10-20"}]))
+        assert "2026-10" not in {r["month"] for r in b["months"]} and b["last_30d"]["advertising_usd"] == 0.0  # before begin
+        ads = dict(settings, advertising=[{"name": "banner", "usd": 30.0, "day": "2026-11-01"},
+                                          {"name": "listing", "usd": 20.0, "day": "2026-11-01"},
+                                          {"name": "old banner", "usd": 10.0, "day": "2026-09-15"}])
+        b = backoffice.statement(bill, sales, monthly, now, ads)                           # one-off advertising
+        rows = {r["month"]: r for r in b["months"]}
+        assert (rows["2026-11"]["advertising_usd"], rows["2026-11"]["operating_usd"], rows["2026-11"]["net_usd"]) == (50.0, -153.0, -163.0)
+        assert (rows["2026-09"]["advertising_usd"], rows["2026-09"]["net_usd"], rows["2026-10"]["advertising_usd"]) == (10.0, -10.0, 0.0)
+        d = b["last_30d"]                                                                  # September is outside the 30 days
+        assert (d["advertising_usd"], d["operating_usd"], d["cash_flow_usd"]) == (50.0, -153.0, -163.0)
+        assert b["monthly_run_cost_usd"] == 1508.0 and b["advertising"] == ads["advertising"]  # a one-off, not a running cost
         os.environ["REDBEARD_BOOKS"] = json.dumps({"operating_start": "soon", "other_projects": ["side"],
                                                    "monthly_costs": [{"name": "vds", "usd": 68, "from": "2026-11-03"},
                                                                      {"name": "no date", "usd": 9}, "junk"],
-                                                   "books_begin": "2026-10-01"})
+                                                   "books_begin": "2026-10-01",
+                                                   "advertising": [{"name": "gfx", "usd": 30, "day": "2026-11-01"},
+                                                                   {"name": "no day", "usd": 20}, "junk"]})
         s = backoffice.book_settings()
         assert s == {"operating_start": None, "other_projects": ("side",), "books_begin": "2026-10-01",
-                     "monthly_costs": [{"name": "vds", "usd": 68.0, "from": "2026-11-03"}]}, s
+                     "monthly_costs": [{"name": "vds", "usd": 68.0, "from": "2026-11-03"}],
+                     "advertising": [{"name": "gfx", "usd": 30.0, "day": "2026-11-01"}]}, s
         os.environ["REDBEARD_BOOKS"] = "not json"
         assert backoffice.book_settings()["operating_start"] is None                       # broken settings: building
     finally:
@@ -972,6 +987,11 @@ def test_backoffice_extra_usage():
     assert (rows["b"]["status"], rows["b"]["balance_usd"]) == ("active", 1.0)    # plan ended, credit still works
     assert (rows["c"]["status"], rows["c"]["balance_usd"]) == ("ended", None)
     assert (rows["d"]["status"], rows["d"]["balance_usd"]) == ("active", None)   # no credit: nothing shown
+
+
+def test_tron_hex():
+    import backoffice  # Tether's USDT contract on TRON, as base58 and as the hex TRON's own explorers give for it
+    assert backoffice.tron_hex("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t") == "a614f803b6fd780986a42c78ec9c7f77e6ded13c"
 
 
 def test_downloads():
