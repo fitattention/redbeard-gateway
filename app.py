@@ -270,8 +270,10 @@ def panel(k, raw):
             {"id": "weekly", "label": "Weekly limit", "used_percent": pct(k.wk_used, limits["weekly"]),
              "resets_at": iso(k.wk_start + 7 * 86400)},
         ]
+    # key_id: the fingerprint's first 8 characters, the same the owner's back office lists, so support can find a key
+    # without ever being sent the key itself
     return {"plan": {"id": k.plan, "name": name, "multiplier": multiplier}, "key_hint": "••••" + raw[-4:],
-            "paid_until": iso(k.paid_until), "windows": windows, "balance": balance}
+            "key_id": k.key_hash[:8], "paid_until": iso(k.paid_until), "windows": windows, "balance": balance}
 
 
 # The app's downloads. The website and install.sh link here so the owner's back office can count them: +1 per hour

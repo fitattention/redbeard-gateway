@@ -109,6 +109,22 @@ def test_store():
         raise AssertionError("an unknown plan was accepted")
     except sqlite3.IntegrityError:
         pass
+    import os, tempfile                                                     # a key file from before balance_cap
+    path = os.path.join(tempfile.mkdtemp(), "old.db")
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE keys (key_hash TEXT PRIMARY KEY, plan TEXT NOT NULL, paid_until INTEGER, balance_micros"
+                " INTEGER NOT NULL, fh_start INTEGER, fh_used INTEGER NOT NULL, wk_start INTEGER NOT NULL,"
+                " wk_used INTEGER NOT NULL, revoked INTEGER NOT NULL)")
+    old.execute("INSERT INTO keys VALUES ('z', 'payg', NULL, 5000000, NULL, 0, 0, 0, 0)")
+    old.commit(); old.close()
+    for opened in range(2):                                                 # opened twice: added once, kept
+        conn = store.connect(path)
+        k = store.get(conn, "z")
+        assert k.balance_micros == 5_000_000 and k.balance_cap == 0 and k.paid_micros == 7_000_000 * opened
+        k.paid_micros = 7_000_000
+        store.put(conn, k)
+        assert store.get(conn, "z").paid_micros == 7_000_000
+        conn.close()
 
 
 # ---------- end to end: a fake kitchen behind the real gateway ----------
@@ -253,6 +269,7 @@ async def run_e2e():
         r = await gw.post("/v1/session", json={"key": raw5})                         # the panel
         assert r.status_code == 200 and r.json()["balance"] == {"currency": "USD", "minor": 499, "used_percent": 0.0}
         assert r.json()["key_hint"] == "••••" + raw5[-4:]
+        assert r.json()["key_id"] == store.hash_key(raw5)[:8]                         # what support looks up
         raw6, _ = add_key("payg", balance_micros=2_000_000, balance_cap=5_000_000)    # $2 left of a $5 tank
         r = await gw.post("/v1/session", json={"key": raw6})                          # bar reads 60% spent
         assert r.json()["balance"] == {"currency": "USD", "minor": 200, "used_percent": 60.0}
@@ -619,6 +636,7 @@ async def run_checkout():
         await gw.get(f"/v1/checkout/{o3['order_id']}")
         assert store.get(conn, hp).plan == "payg" and store.get(conn, hp).balance_micros == 20_000_000
         assert store.get(conn, hp).balance_cap == 20_000_000              # the top-up filled the tank to full
+        assert store.get(conn, hp).paid_micros == 20_000_000 and store.get(conn, h).paid_micros == 200_000_000  # 2 x $100
 
         o4 = (await gw.post("/v1/checkout", json={"key_hash": store.hash_key("rb_x"), "plan": "starter"})).json()
         invoices[f"inv{len(invoices)}"].update(status="expired")                          # never paid
@@ -641,6 +659,7 @@ async def run_checkout():
         assert (await gw.get(f"/v1/checkout/{o7['order_id']}")).json()["status"] == "paid"
         k = store.get(conn, h)
         assert k.plan == "power" and k.paid_until == first + 30 * DAY and k.balance_micros == 5_000_000
+        assert k.paid_micros == 205_000_000 and store.get(conn, hp).paid_micros == 70_000_000   # every payment adds up
 
         gateway.hits.clear()
         bad = [{"key_hash": "abc", "plan": "power"}, {"key_hash": h, "plan": "gold"},
@@ -705,13 +724,23 @@ def test_backoffice():
     def bitcart_time(t):
         return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
-    def inv(iid, status, price, created, paid=None, chain="bnb", meta=None, exc="none", sent=0.0):
+    def inv(iid, status, price, created, paid=None, chain="bnb", meta=None, exc="none", sent=0.0, typed=None):
         invoices[iid] = {"id": iid, "order_id": "o" + iid, "status": status, "exception_status": exc,
                          "price": f"{price:.2f}", "created": bitcart_time(created),
                          "paid_date": bitcart_time(paid) if paid else None, "metadata": meta or {}, "sent_amount": sent,
                          "tx_hashes": ["0xabc"] if paid else [], "payments": [
-                             {"currency": c, "payment_address": a, "contract": "c-" + c, "is_used": c == chain and bool(paid)}
+                             {"currency": c, "payment_address": a, "contract": "c-" + c, "is_used": c == chain and bool(paid),
+                              "user_address": typed if c == chain else None}
                              for c, a in (("trx", "TAddr"), ("bnb", "0xaddr"), ("eth", "0xaddr"))]}
+
+    reads, chain_down = [], {"on": False}
+
+    async def fake_transfers(chain, address, contract, start, end):             # the chain, read Bitcart aside
+        reads.append((chain, address, contract))
+        if chain_down["on"]:
+            raise httpx.ConnectError("explorer down")
+        return [{"at": start + 240, "usdt": 12.5, "sender": "0xother", "tx": "0xSTRAY"},   # from another wallet
+                {"at": start + 60, "usdt": 5.0, "sender": "0xtyped", "tx": "0xABC"}]       # sale a's: counted already
 
     async def fake_balance(chain, address, contract):
         if chain == "eth":
@@ -737,12 +766,15 @@ def test_backoffice():
         inv("c", "expired", 50, now - 3 * DAY)
         inv("d", "pending", 200, now - HOUR, exc="paid_partial", sent=150.0)            # underpaid: stuck
         inv("e", "complete", 50, now - 2 * HOUR, now - 2 * HOUR + 600, chain="trx")
+        inv("f", "expired", 9, now - HOUR / 2, chain="eth", typed="0xtyped")            # paid from another wallet
+        backoffice.transfers_in, backoffice._strays = fake_transfers, {}
         _, h_ok = add_key("power")
         add_key("max", paid_until=int(now) + 3 * DAY)                                    # ends within a week
         add_key("starter", paid_until=int(now) - DAY)                                    # ended
         add_key("payg", balance_micros=4_990_000, balance_cap=5_000_000)
         add_key("power", revoked=1)
-        for ref, iid, kind, plan, cents in (("od", "d", "plan", "max", 20000), ("oc", "c", "plan", "starter", 5000)):
+        for ref, iid, kind, plan, cents in (("od", "d", "plan", "max", 20000), ("oc", "c", "plan", "starter", 5000),
+                                            ("of", "f", "topup", None, 900)):
             conn.execute("INSERT INTO orders (order_id, key_hash, kind, plan, cents, invoice_id, created) VALUES"
                          " (?, ?, ?, ?, ?, ?, ?)", (ref, "f" * 64, kind, plan, cents, iid, int(now)))
         stats.add("power", "api", prompt_tokens=1_000, completion_tokens=900)            # counts 1,000
@@ -771,7 +803,7 @@ def test_backoffice():
             o = r.json()
             s = o["summary"]
             assert s["revenue"] == {"24h": 50.0, "7d": 150.0, "30d": 150.0, "all": 155.0}, s["revenue"]
-            assert s["funnel"] == {"started": 4, "paid": 2, "expired": 1, "underpaid": 1, "minutes_to_pay": 6.0}, s["funnel"]
+            assert s["funnel"] == {"started": 5, "paid": 2, "expired": 2, "underpaid": 1, "minutes_to_pay": 6.0}, s["funnel"]
             assert s["keys"]["active"] == {"power": 1, "max": 2, "payg": 1} and s["keys"]["ending_7d"] == 1
             assert s["keys"]["ended"] == 1 and s["keys"]["payg_owed_usd"] == 4.99
             assert s["gpu"] == {"source": "estimate", "hours_30d": 1.0, "hourly": 2.0, "estimate_30d": 2.0, "billed_30d": None,
@@ -781,7 +813,7 @@ def test_backoffice():
             assert s["plans"]["power"] == {"active_keys": 1, "tokens_30d": 1000, "revenue_30d": 100.0, "cost_30d": 0.5}
             assert s["plans"]["max"]["cost_30d"] == 1.5 and s["plans"]["starter"]["cost_30d"] == 0.0
             by = {x["id"]: x for x in o["sales"]}
-            assert [x["id"] for x in o["sales"]] == ["d", "e", "a", "c", "b"]                # newest first
+            assert [x["id"] for x in o["sales"]] == ["f", "d", "e", "a", "c", "b"]           # newest first
             assert by["a"]["plan"] == "power" and not by["a"]["guessed"] and by["a"]["network"] == "BNB Smart Chain"
             assert by["a"]["tx_url"] == "https://bscscan.com/tx/0xabc"
             assert by["e"]["tx_url"] == "https://tronscan.org/#/transaction/0xabc"
@@ -790,6 +822,28 @@ def test_backoffice():
             orders = {x["ref"]: x for x in o["orders"]}
             assert orders["od"]["stuck"] and orders["od"]["sent"] == 150.0 and not orders["oc"]["stuck"]
             assert "f" * 64 not in json.dumps(o["orders"]) and "f" * 64 not in json.dumps(o["sales"])  # a sale never names a key
+            assert all(x["key_id"] == "f" * 8 for x in o["orders"])                       # an order: the key's first 8 only
+            stray = orders["of"]["unmatched"]                                             # paid, but from another wallet:
+            assert orders["of"]["stuck"] and [p["tx"] for p in stray] == ["0xSTRAY"], stray   # the counted one left out
+            assert stray[0]["usdt"] == 12.5 and stray[0]["typed"] == "0xtyped" and stray[0]["sender"] == "0xother"
+            assert stray[0]["network"] == "Ethereum" and stray[0]["fits_orders"] == 1
+            assert stray[0]["tx_url"] == "https://etherscan.io/tx/0xSTRAY"
+            assert orders["oc"]["unmatched"] == [] and orders["od"]["unmatched"] == []    # no wallet typed / still open
+            assert reads == [("eth", "0xaddr", "c-eth")]                                  # two page loads, one chain read
+            backoffice._strays.clear()
+            chain_down["on"] = True
+            o_down = (await gw.get("/v1/admin/overview", headers=ok)).json()
+            down = {x["ref"]: x for x in o_down["orders"]}["of"]
+            assert down["unmatched"] is None and not down["stuck"]                        # unread: unknown, never "none"
+            chain_down["on"] = False
+            backoffice._strays.clear()
+            inv("g", "expired", 9, now - HOUR / 3, chain="eth", typed="0xelse")           # a second order the same
+            conn.execute("INSERT INTO orders (order_id, key_hash, kind, plan, cents, invoice_id, created) VALUES"
+                         " ('og', ?, 'topup', NULL, 900, 'g', ?)", ("e" * 64, int(now)))   # payment fits too
+            both = {x["ref"]: x for x in (await gw.get("/v1/admin/overview", headers=ok)).json()["orders"]}
+            assert both["of"]["unmatched"][0]["fits_orders"] == 2 == both["og"]["unmatched"][0]["fits_orders"]
+            conn.execute("DELETE FROM orders WHERE order_id = 'og'")
+            del invoices["g"]
             assert {k["status"] for k in o["keys"]} == {"active", "ended", "revoked"} and len(o["keys"]) == 6
             assert any(k["fp"] == h_ok for k in o["keys"])
             assert {(x["plan"], x["source"]) for x in o["hourly"]} == {("power", "api"), ("max", "chat")}
@@ -866,10 +920,11 @@ def test_backoffice():
                      for _ in range(31)]
             assert codes[:30] == [401] * 30 and codes[30] == 429                          # guessing slowed
 
-    real_balance, real_bill = backoffice.balance, backoffice.gpu_bill
+    real_balance, real_bill, real_transfers = backoffice.balance, backoffice.gpu_bill, backoffice.transfers_in
     try:
         asyncio.run(run())
     finally:
+        backoffice.transfers_in, backoffice._strays = real_transfers, {}
         backoffice.balance, backoffice.ADMIN_HASH, backoffice._wallets = real_balance, "", (0.0, [])
         backoffice.gpu_bill = real_bill
         checkout._client = None

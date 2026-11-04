@@ -89,6 +89,7 @@ def credit(conn, order_id):
             else:
                 k.balance_micros += o["cents"] * 10_000
                 k.balance_cap = k.balance_micros   # a top-up fills the tank: the panel bar reads full again
+            k.paid_micros += o["cents"] * 10_000
             store.put(conn, k)
             conn.execute("UPDATE orders SET done = 1 WHERE order_id = ?", (order_id,))
         conn.execute("COMMIT")

@@ -6,8 +6,14 @@ is unset the back office is off.
 One admin key, kept only as its SHA-256 in REDBEARD_ADMIN_HASH; while that is unset every admin route answers 404.
 It reads what already exists and keeps the halves apart as they are on disk: sales come from Bitcart (the gateway's
 own invoice token, nothing new), keys from the key table, usage from stats.py's anonymous hourly totals; a sale is
-never joined to a key. Wallet balances are read from the public chains, so this server never holds Bitcart's wallet
+never joined to a key (an open order, kept a week for support, names its key by the fingerprint's first 8
+characters only). Wallet balances are read from the public chains, so this server never holds Bitcart's wallet
 access (which could change the address customers pay into). Something it can't read shows as null, never as 0.
+
+Bitcart credits a token payment only when it comes FROM the wallet the buyer typed at checkout (its
+genericprocessor.process_transaction); money from any other wallet, an exchange's above all, is silently ignored.
+So for every expired open order the page also reads the chain itself: a payment into the shop's wallet on that
+order's network, within STRAY_WINDOW of it, that no sale counted.
 Settings: REDBEARD_ADMIN_HASH, REDBEARD_ADMIN_PATH, REDBEARD_GPU_HOURLY (dollars an hour for the GPU box: the estimate
 used when the real bill can't be read). The real GPU bill comes from an optional private module, gpu_bill, kept out
 of this public code; it holds only the owner's own costs, never anything about customers.
@@ -50,6 +56,10 @@ PLAN_BY_PRICE = {cents / 100: plan for plan, cents in checkout.PRICES.items()}  
 RPC = {"bnb": "https://bsc-rpc.publicnode.com", "matic": "https://polygon-bor-rpc.publicnode.com",
        "eth": "https://ethereum-rpc.publicnode.com"}
 TRONGRID = "https://api.trongrid.io/wallet/triggerconstantcontract"
+BLOCKSCOUT = {"eth": "https://eth.blockscout.com"}  # publicnode answers Ethereum log reads with 403 (2026-11-04)
+TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"  # a token's Transfer event
+STRAY_WINDOW = 3 * 3600  # a payment this long after an order was made may be that order's
+_strays = {}  # order ref -> (when read, payments found): an order's chain is read again at most every 5 minutes
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 DAY = 86400
 PRODUCT_BOXES = ("sherlock", "watson")  # boxes that serve customers, by their label at the GPU provider
@@ -136,6 +146,88 @@ async def balance(chain, address, contract):
     return units / 10 ** await call("0x313ce567")                          # decimals()
 
 
+async def evm(chain, method, params):
+    r = await checkout.gw().client().post(RPC[chain], json={"jsonrpc": "2.0", "id": 1, "method": method,
+                                                             "params": params}, timeout=15)
+    r.raise_for_status()
+    body = r.json()
+    if "error" in body:
+        raise ValueError(str(body["error"]))
+    return body["result"]
+
+
+async def transfers_in(chain, address, contract, start, end):
+    """The token payments INTO one address between two times (seconds), read from the chain itself, Bitcart aside:
+    [{"at", "usdt", "sender", "tx"}]. Raises when the chain can't be read."""
+    c, out = checkout.gw().client(), []
+    if chain == "trx":
+        r = await c.get(f"https://api.trongrid.io/v1/accounts/{address}/transactions/trc20", timeout=15, params={
+            "only_to": "true", "contract_address": contract, "min_timestamp": int(start * 1000),
+            "max_timestamp": int(end * 1000), "limit": 50})
+        r.raise_for_status()
+        for m in r.json().get("data") or []:
+            if m.get("to") == address:
+                out.append({"at": m["block_timestamp"] / 1000, "usdt": int(m["value"]) / 10 ** int(m["token_info"]["decimals"]),
+                            "sender": m["from"], "tx": m["transaction_id"]})
+        return out
+    if chain in BLOCKSCOUT:
+        r = await c.get(f"{BLOCKSCOUT[chain]}/api/v2/addresses/{address}/token-transfers", timeout=15,
+                        params={"type": "ERC-20", "filter": "to", "token": contract})
+        r.raise_for_status()
+        for m in r.json().get("items") or []:  # ponytail: the newest 50 only; follow next_page_params if the wallet gets busy
+            at = ts(m["timestamp"])
+            if start <= at <= end and m["to"]["hash"].lower() == address.lower():
+                out.append({"at": at, "usdt": int(m["total"]["value"]) / 10 ** int(m["total"]["decimals"]),
+                            "sender": m["from"]["hash"], "tx": m.get("transaction_hash") or m.get("tx_hash")})
+        return out
+    # BNB Smart Chain, Polygon: the token's Transfer events to this address, in the blocks around the window. The
+    # seconds per block are measured now (BNB's have changed before), and each event is checked by its own block's time.
+    async def time_of(n):
+        return int((await evm(chain, "eth_getBlockByNumber", [hex(n), False]))["timestamp"], 16)
+    tip = int(await evm(chain, "eth_blockNumber", []), 16)
+    tip_at, back = await time_of(tip), max(0, tip - 100_000)
+    per = (tip_at - await time_of(back)) / max(1, tip - back)
+    first = max(0, tip - int((tip_at - start) / per) - 600)
+    last = min(tip, tip - int((tip_at - end) / per) + 600)
+    to = "0x" + address[2:].lower().rjust(64, "0")
+    logs = []
+    for a in range(first, last + 1, 5000):
+        logs += await evm(chain, "eth_getLogs", [{"address": contract, "fromBlock": hex(a),
+                                                  "toBlock": hex(min(a + 4999, last)), "topics": [TRANSFER, None, to]}])
+    if logs:
+        unit = 10 ** int(await evm(chain, "eth_call", [{"to": contract, "data": "0x313ce567"}, "latest"]), 16)  # decimals()
+    for l in logs:
+        at = await time_of(int(l["blockNumber"], 16))
+        if start <= at <= end:
+            out.append({"at": at, "usdt": int(l["data"], 16) / unit, "sender": "0x" + l["topics"][1][-40:],
+                        "tx": l["transactionHash"]})
+    return out
+
+
+async def strays(ref, inv, created, counted, now):
+    """Payments into the shop's wallet on the network this order chose (the one its buyer typed a paying wallet on),
+    within STRAY_WINDOW of the order, that no sale counted. [] when there are none; None when the chain couldn't be
+    read. Read again at most every 5 minutes, and never again once read after the window closed."""
+    method = next((p for p in inv.get("payments") or [] if p.get("user_address") and p.get("contract")), None)
+    if method is None:
+        return []  # no paying wallet typed: the page never showed where to pay
+    seen = _strays.get(ref)
+    if seen and (seen[0] >= created + STRAY_WINDOW or now - seen[0] < 300):
+        return seen[1]
+    chain = str(method.get("currency") or "").lower()
+    try:
+        found = await transfers_in(chain, method["payment_address"], method["contract"], created,
+                                   min(now, created + STRAY_WINDOW))
+    except Exception:  # one chain's reader being down must not hide the page
+        return None
+    rows = [{"at": checkout.gw().iso(int(f["at"])), "usdt": round(f["usdt"], 6), "sender": f["sender"],
+             "typed": method["user_address"], "network": checkout.NETWORKS.get(chain, chain.upper()),
+             "tx": f["tx"], "tx_url": explorer(chain, "tx", f["tx"])}
+            for f in sorted(found, key=lambda f: f["at"]) if str(f["tx"]).lower() not in counted]
+    _strays[ref] = (now, rows)
+    return rows
+
+
 async def wallets(newest):
     """The receiving addresses on the newest invoice (so a wallet change shows by itself), with their USDT."""
     global _wallets
@@ -175,6 +267,7 @@ def keys(conn, now):
             "five_hour_pct": None if payg else pct(v.fh_used, limits.get("five_hour")),
             "week_pct": None if payg else pct(v.wk_used, limits.get("weekly")),
             "balance_usd": round(k.balance_micros / 1e6, 2) if credit else None,
+            "paid_usd": round(k.paid_micros / 1e6, 2),  # through checkout, all time
             "balance_left_pct": pct(k.balance_micros, max(k.balance_cap, k.balance_micros)) if credit else None})
     return out
 
@@ -415,15 +508,25 @@ async def overview(door: str, request: Request):
         raw, sales = None, None
     key_rows = keys(g.conn(), now)
     by_invoice = {s["id"]: s for s in sales or []}
+    raw_by_id = {i.get("id"): i for i in raw or []}
+    counted = {str(s["tx"]).lower() for s in sales or [] if s["tx"]}
     orders = []
-    for ref, kind, plan, cents, invoice_id, created in g.conn().execute(
-            "SELECT order_id, kind, plan, cents, invoice_id, created FROM orders WHERE done = 0 ORDER BY created DESC"):
+    rows = g.conn().execute("SELECT order_id, key_hash, kind, plan, cents, invoice_id, created FROM orders"
+                            " WHERE done = 0 ORDER BY created DESC").fetchall()
+    found = await asyncio.gather(*(strays(ref, raw_by_id[iid], created, counted, now)
+                                   if iid in raw_by_id and by_invoice[iid]["status"] in ("expired", "invalid")
+                                   else asyncio.sleep(0, []) for ref, _, _, _, _, iid, created in rows))
+    for (ref, key_hash, kind, plan, cents, invoice_id, created), unmatched in zip(rows, found):
         s = by_invoice.get(invoice_id)
-        orders.append({"ref": ref, "kind": kind, "plan": plan or "payg", "usd": cents / 100, "created": g.iso(created),
-                       "status": s["status"] if s else None, "sent": s["sent"] if s else None,
-                       "underpaid": bool(s and s["underpaid"]),
-                       "stuck": bool(s and (s["underpaid"] or s["status"] in ("paid", "confirmed", "complete")
-                                            or (s["status"] == "expired" and s["sent"] > 0)))})
+        orders.append({"ref": ref, "key_id": key_hash[:8], "kind": kind, "plan": plan or "payg", "usd": cents / 100,
+                       "created": g.iso(created), "status": s["status"] if s else None, "sent": s["sent"] if s else None,
+                       "underpaid": bool(s and s["underpaid"]), "unmatched": unmatched,
+                       "stuck": bool(unmatched) or bool(s and (s["underpaid"] or s["status"] in ("paid", "confirmed", "complete")
+                                                                or (s["status"] == "expired" and s["sent"] > 0)))})
+    claims = Counter(p["tx"] for o in orders for p in o["unmatched"] or [])
+    for o in orders:  # one payment that fits two orders is credited to one of them only
+        for p in o["unmatched"] or []:
+            p["fits_orders"] = claims[p["tx"]]
     month = now - 30 * DAY
     hourly, load = stats.rows(stats.hour_of(month))
     names = list(g.UPSTREAMS)

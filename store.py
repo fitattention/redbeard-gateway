@@ -23,6 +23,7 @@ class Key:
     wk_start: int = 0
     wk_used: int = 0
     revoked: int = 0
+    paid_micros: int = 0        # all money paid onto this key through checkout: a running total, never which payment
 
 
 COLUMNS = ",".join(f.name for f in fields(Key))
@@ -46,11 +47,13 @@ def connect(path: str) -> sqlite3.Connection:
         " paid_until INTEGER, balance_micros INTEGER NOT NULL,"
         " fh_start INTEGER, fh_used INTEGER NOT NULL,"
         " wk_start INTEGER NOT NULL, wk_used INTEGER NOT NULL,"
-        " revoked INTEGER NOT NULL, balance_cap INTEGER NOT NULL DEFAULT 0)"
+        " revoked INTEGER NOT NULL, balance_cap INTEGER NOT NULL DEFAULT 0, paid_micros INTEGER NOT NULL DEFAULT 0)"
     )
-    # balance_cap was added later; give it to any table made before it (DEFAULT fills existing rows with 0).
-    if not any(r[1] == "balance_cap" for r in conn.execute("PRAGMA table_info(keys)")):
-        conn.execute("ALTER TABLE keys ADD COLUMN balance_cap INTEGER NOT NULL DEFAULT 0")
+    # Columns added later; give them to any table made before them (DEFAULT fills existing rows with 0).
+    have = {r[1] for r in conn.execute("PRAGMA table_info(keys)")}
+    for column in ("balance_cap", "paid_micros"):
+        if column not in have:
+            conn.execute(f"ALTER TABLE keys ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
     # An open crypto order links an invoice to a key fingerprint; checkout.py deletes it 24 hours after it was made.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS orders ("
