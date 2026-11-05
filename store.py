@@ -4,6 +4,7 @@ import os
 import secrets
 import sqlite3
 import string
+import time
 from dataclasses import astuple, dataclass, fields
 
 ALPHABET = string.ascii_letters + string.digits
@@ -60,7 +61,30 @@ def connect(path: str) -> sqlite3.Connection:
         " order_id TEXT PRIMARY KEY, key_hash TEXT NOT NULL, kind TEXT NOT NULL, plan TEXT,"
         " cents INTEGER NOT NULL, invoice_id TEXT NOT NULL, created INTEGER NOT NULL, done INTEGER NOT NULL DEFAULT 0)"
     )
+    # Money the shop never matched to a sale (paid from another wallet than the one typed and credited by hand, or a
+    # direct payment with no order): the books count it. Only the key's fingerprint's first 8 (its Key ID), never a key.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS manual_sales ("
+        " id INTEGER PRIMARY KEY, paid_at INTEGER NOT NULL, usd REAL NOT NULL, sent REAL, chain TEXT, tx TEXT,"
+        " plan TEXT, kind TEXT NOT NULL, key_id TEXT, note TEXT, recorded INTEGER NOT NULL)"
+    )
     return conn
+
+
+MANUAL_COLUMNS = ("id", "paid_at", "usd", "sent", "chain", "tx", "plan", "kind", "key_id", "note", "recorded")
+
+
+def add_manual_sale(conn, paid_at, usd, kind, plan=None, key_id=None, sent=None, chain=None, tx=None, note=None):
+    """A sale the shop never counted; returns its row id."""
+    return conn.execute("INSERT INTO manual_sales (paid_at, usd, sent, chain, tx, plan, kind, key_id, note, recorded)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (int(paid_at), float(usd), sent, chain, tx, plan, kind, key_id, note, int(time.time()))).lastrowid
+
+
+def manual_sales(conn):
+    """Every sale recorded by hand, newest first."""
+    return [dict(zip(MANUAL_COLUMNS, r))
+            for r in conn.execute(f"SELECT {', '.join(MANUAL_COLUMNS)} FROM manual_sales ORDER BY paid_at DESC, id DESC")]
 
 
 def get(conn: sqlite3.Connection, key_hash: str) -> Key | None:

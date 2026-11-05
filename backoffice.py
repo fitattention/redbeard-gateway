@@ -51,7 +51,7 @@ router = APIRouter()
 ADMIN_HASH = os.environ.get("REDBEARD_ADMIN_HASH", "").strip().lower()
 ADMIN_PATH = os.environ.get("REDBEARD_ADMIN_PATH", "").strip()  # unset: off, never a guessable default
 GPU_HOURLY = float(os.environ.get("REDBEARD_GPU_HOURLY") or 0)  # only for the estimate, when the bill can't be read
-COMMANDS = ("new", "extend", "topup", "revoke", "credit")
+COMMANDS = ("new", "extend", "topup", "revoke", "credit", "sale")
 PLAN_BY_PRICE = {cents / 100: plan for plan, cents in checkout.PRICES.items()}  # sales made before metadata: guessed
 RPC = {"bnb": "https://bsc-rpc.publicnode.com", "matic": "https://polygon-bor-rpc.publicnode.com",
        "eth": "https://ethereum-rpc.publicnode.com"}
@@ -89,6 +89,28 @@ def explorer(chain, what, value):
 
 def ts(text):
     return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() if text else None
+
+
+def iso(t):
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def with_manual(sales, conn):
+    """Bitcart's sales plus the ones recorded by hand (store.manual_sales: an order credited by hand, a direct
+    payment), in the sales list's own shape, newest first. Unknown (None) stays unknown."""
+    if sales is None:
+        return None
+    rows = []
+    for m in store.manual_sales(conn):
+        chain = m["chain"] or ""
+        rows.append({"id": f"manual-{m['id']}", "order": None, "created": iso(m["paid_at"]), "paid_at": iso(m["paid_at"]),
+                     "status": "complete", "underpaid": False, "usd": m["usd"],
+                     "sent": m["sent"] if m["sent"] is not None else m["usd"], "plan": m["plan"] or "payg",
+                     "renewal": None, "guessed": False,
+                     "network": checkout.NETWORKS.get(chain, chain.upper()) if chain else None,
+                     "tx": m["tx"], "tx_url": explorer(chain, "tx", m["tx"]) if m["tx"] and chain else None,
+                     "manual": True, "note": m["note"]})
+    return sorted(sales + rows, key=lambda s: ts(s["created"]) or 0, reverse=True)
 
 
 async def invoices():
@@ -221,7 +243,7 @@ async def strays(ref, inv, created, counted, now):
     except Exception:  # one chain's reader being down must not hide the page
         return None
     rows = [{"at": checkout.gw().iso(int(f["at"])), "usdt": round(f["usdt"], 6), "sender": f["sender"],
-             "typed": method["user_address"], "network": checkout.NETWORKS.get(chain, chain.upper()),
+             "typed": method["user_address"], "network": checkout.NETWORKS.get(chain, chain.upper()), "chain": chain,
              "tx": f["tx"], "tx_url": explorer(chain, "tx", f["tx"])}
             for f in sorted(found, key=lambda f: f["at"]) if str(f["tx"]).lower() not in counted]
     _strays[ref] = (now, rows)
@@ -294,7 +316,7 @@ def summary(sales, key_rows, hourly, hours, now, spent=None):
     if sales is not None:
         out["revenue"] = {name: round(sum(s["usd"] for s in paid if days is None or ts(s["paid_at"] or s["created"]) >= now - days * DAY), 2)
                           for name, days in (("24h", 1), ("7d", 7), ("30d", 30), ("all", None))}
-        recent = [s for s in sales if ts(s["created"]) >= month]
+        recent = [s for s in sales if not s.get("manual") and ts(s["created"]) >= month]  # the funnel: checkouts only
         waits = [(ts(s["paid_at"]) - ts(s["created"])) / 60 for s in recent if s["status"] == "complete" and s["paid_at"]]
         out["funnel"] = {"started": len(recent), "paid": sum(s["status"] == "complete" for s in recent),
                          "expired": sum(s["status"] == "expired" for s in recent),
@@ -503,7 +525,7 @@ async def overview(door: str, request: Request):
     g, now = checkout.gw(), int(time.time())
     try:
         raw = await invoices()
-        sales = [sale(i) for i in raw]
+        sales = with_manual([sale(i) for i in raw], g.conn())
     except (httpx.HTTPError, ValueError):
         raw, sales = None, None
     key_rows = keys(g.conn(), now)
@@ -562,6 +584,11 @@ async def run(door: str, request: Request):
     except (ValueError, AttributeError, AssertionError):
         return g.error(400, "bad_command", f"Send {{\"args\": [command, ...]}} with one of: {', '.join(COMMANDS)}.")
     try:
-        return {"output": admin.main(args, g.conn())}
+        found = None
+        if args[0] == "credit":  # what the page read on the chain for this order, so the sale row carries it
+            rows = (_strays.get(args[1]) or (0, []))[1] or []
+            found = next(({"at": int(ts(p["at"])), "usdt": p["usdt"], "chain": p.get("chain"), "tx": p["tx"]}
+                          for p in rows), None)
+        return {"output": admin.main(args, g.conn(), found)}
     except ValueError as e:
         return g.error(400, "refused", str(e).splitlines()[0])

@@ -304,7 +304,7 @@ async def run_e2e():
         assert r.json()["error"]["message"].startswith("We're updating Sherlock") and "redbeard.sbs/status/" in r.json()["error"]["message"]
 
     tables = [t for (t,) in gateway.app.state.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
-    assert tables == ["keys", "orders"]                                                # nothing else is kept
+    assert tables == ["keys", "orders", "manual_sales"]                                # nothing else is kept
     assert "hi" not in str(gateway.app.state.conn.execute("SELECT * FROM keys").fetchall())
 
 
@@ -1042,6 +1042,54 @@ def test_backoffice_extra_usage():
     assert (rows["b"]["status"], rows["b"]["balance_usd"]) == ("active", 1.0)    # plan ended, credit still works
     assert (rows["c"]["status"], rows["c"]["balance_usd"]) == ("ended", None)
     assert (rows["d"]["status"], rows["d"]["balance_usd"]) == ("active", None)   # no credit: nothing shown
+
+
+def test_manual_sales():
+    """Money the shop never matched still becomes a sale: crediting an order by hand records one (carrying what the
+    page read on the chain), `sale` records a direct payment, both join the books and the sales list newest first,
+    neither counts as a started checkout, a second credit makes no second row, and unknown stays unknown."""
+    import admin
+    import backoffice
+    conn = store.connect(":memory:")
+    now = int(time.time())
+    conn.execute("INSERT INTO orders (order_id, key_hash, kind, plan, cents, invoice_id, created) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 ("ref7", "a" * 64, "topup", None, 700, "inv7", now - 600))
+    found = {"at": now - 300, "usdt": 7.00827, "chain": "eth", "tx": "0xba9e"}
+    assert "credited" in admin.main(["credit", "ref7"], conn, found)
+    rows = store.manual_sales(conn)
+    assert len(rows) == 1 and rows[0]["usd"] == 7.0 and rows[0]["sent"] == 7.00827 and rows[0]["chain"] == "eth"
+    assert rows[0]["tx"] == "0xba9e" and rows[0]["key_id"] == "a" * 8 and rows[0]["kind"] == "topup"
+    assert rows[0]["plan"] == "payg" and rows[0]["paid_at"] == now - 300 and "ref7" in rows[0]["note"]
+    assert store.get(conn, "a" * 64).balance_micros == 7_000_000                     # the key got its money
+    try:
+        admin.main(["credit", "ref7"], conn, found)
+        raise AssertionError("credited twice")
+    except ValueError:
+        pass
+    assert len(store.manual_sales(conn)) == 1
+    assert "$35.00" in admin.main(["sale", "35", "roker: one month, TRON tx 6a12"], conn)
+    assert store.manual_sales(conn)[0]["kind"] == "direct" and store.manual_sales(conn)[0]["key_id"] is None
+    for bad in (["sale", "abc", "x"], ["sale", "-5", "x"], ["sale", "35", " "], ["sale", "35", "x" * 201], ["sale", "35"]):
+        try:
+            admin.main(bad, conn)
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+    assert len(store.manual_sales(conn)) == 2
+    bitcart = [{"id": "b1", "order": "o1", "created": backoffice.iso(now - 60), "paid_at": backoffice.iso(now - 30),
+                "status": "complete", "underpaid": False, "usd": 5.0, "sent": 5.0, "plan": "payg", "renewal": None,
+                "guessed": False, "network": "TRON", "tx": "t1", "tx_url": None}]
+    merged = backoffice.with_manual(bitcart, conn)
+    assert [s["usd"] for s in merged] == [35.0, 5.0, 7.0], [s["usd"] for s in merged]  # newest first
+    assert merged[0]["manual"] and merged[0]["status"] == "complete" and merged[0]["network"] is None
+    assert merged[2]["network"] == "Ethereum" and merged[2]["tx_url"].endswith("/tx/0xba9e") and merged[2]["sent"] == 7.00827
+    assert merged[1].get("manual") is None and backoffice.with_manual(None, conn) is None
+    s = backoffice.summary(merged, [], [], 0, now)
+    assert s["revenue"]["30d"] == 47.0 and s["revenue"]["all"] == 47.0, s["revenue"]
+    assert s["funnel"]["started"] == 1 and s["funnel"]["paid"] == 1, s["funnel"]        # checkouts only
+    a = backoffice.accounts(merged, None, {}, [], [], None, now)
+    assert sum(r["sales_usd"] for r in a["months"]) == 47.0 and sum(r["sales"] for r in a["months"]) == 3
+    assert "rb_" not in str(store.manual_sales(conn)) and "a" * 64 not in str(store.manual_sales(conn))
 
 
 def test_tron_hex():

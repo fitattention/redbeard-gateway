@@ -7,7 +7,10 @@
   python admin.py revoke KEY           refuse the key from now on
   python admin.py show KEY             plan, paid until, usage
   python admin.py order REF            a checkout order: what it was for, credited or not (support)
-  python admin.py credit REF           give that order's key what was paid for: a late or short payment (support)
+  python admin.py credit REF           give that order's key what was paid for: a late or short payment (support);
+                                       the books then count it as a sale (the shop itself never matched it)
+  python admin.py sale 35 "who, what"  a direct payment with no order (money sent to a wallet by hand): a sale for
+                                       the books, nothing on any key
 
 KEY is the customer's key (rb_...) or its 64-character fingerprint. Keys file: REDBEARD_DB, or keys.db here.
 """
@@ -49,8 +52,17 @@ def describe(k):
             + (f", extra usage ${k.balance_micros / 1_000_000:.2f}" if k.balance_cap or k.balance_micros else ""))
 
 
-def main(args, conn):
+def main(args, conn, found=None):
+    """found: for `credit`, what the back office read on the chain for that order ({"at", "usdt", "chain", "tx"}),
+    so the sale row carries the real payment; None when nothing was read (the command run from a shell)."""
     now = int(time.time())
+    if len(args) == 3 and args[0] == "sale":
+        usd = dollars(args[1]) / 1_000_000
+        note = args[2].strip()
+        if not note or len(note) > 200:
+            raise ValueError("say what it was, up to 200 characters: who, what for, the transaction")
+        store.add_manual_sale(conn, now, usd, "direct", note=note)
+        return f"sale recorded for the books: ${usd:.2f}, {note}"
     if len(args) >= 2 and args[0] == "new":
         plan = args[1]
         if plan not in store.PLAN_IDS:
@@ -87,6 +99,11 @@ def main(args, conn):
                 raise ValueError("this order was already credited")
             checkout.credit(conn, args[1])
             o = checkout.get_order(conn, args[1])
+            # The shop counts only payments it matched itself; one credited by hand is a sale for the books too.
+            f = found or {}
+            store.add_manual_sale(conn, f.get("at") or now, o["cents"] / 100, o["kind"], o["plan"] or "payg",
+                                  o["key_hash"][:8], f.get("usdt"), f.get("chain"), f.get("tx"),
+                                  f"order {o['order_id']}, credited by hand")
         k = store.get(conn, o["key_hash"])
         what = f"{o['plan']} plan, 30 days" if o["kind"] == "plan" else "pay-as-you-go top-up"
         return (f"order {o['order_id']}: {what}, ${o['cents'] / 100:.2f}, made {when(o['created'])}, "
