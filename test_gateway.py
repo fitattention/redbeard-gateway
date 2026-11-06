@@ -617,6 +617,7 @@ async def run_checkout():
             await gw.get(f"/v1/checkout/{o['order_id']}")
             await gw.post(f"/v1/checkout/{o['order_id']}/notify")
         assert store.get(conn, h).paid_until == first
+        assert checkout.credit(conn, o["order_id"]) is False                              # a second credit: refused
 
         r = await gw.post("/v1/chat/completions", headers={"Authorization": f"Bearer {raw}"},   # the bought key works
                           json={"model": "sherlock", "messages": [{"role": "user", "content": "hi"}]})

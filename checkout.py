@@ -18,6 +18,11 @@ from fastapi import APIRouter, Request
 import meter
 import store
 
+try:
+    import alerts  # private: the owner's own sale notice (not part of the public code)
+except ImportError:
+    alerts = None
+
 PRICES = {"starter": 5000, "power": 10000, "max": 20000}  # cents per 30 days; web/app/site.ts shows the same prices
 TOPUP_MIN, TOPUP_MAX = 500, 100_000                        # pay-as-you-go top-up, cents ($5 to $1,000)
 KEEP_ORDERS = 86400              # a finished order's invoice <-> key link: deleted after a day
@@ -75,11 +80,14 @@ def get_order(conn, order_id):
 
 
 def credit(conn, order_id):
-    """Give the key what was paid for, exactly once. Synchronous, in one SQLite transaction."""
+    """Give the key what was paid for, exactly once. Synchronous, in one SQLite transaction. True only for the call
+    that did the crediting (so a sale is announced once, however many pings and polls race to credit it)."""
+    credited = False
     conn.execute("BEGIN IMMEDIATE")
     try:
         o = get_order(conn, order_id)
         if o and not o["done"]:
+            credited = True
             now = int(time.time())
             k = store.get(conn, o["key_hash"]) or store.Key(key_hash=o["key_hash"], plan=o["plan"] or "payg")
             meter.refresh(k, now)
@@ -96,6 +104,7 @@ def credit(conn, order_id):
     except Exception:
         conn.execute("ROLLBACK")
         raise
+    return credited
 
 
 async def check(order_id):
@@ -109,8 +118,8 @@ async def check(order_id):
         inv = r.json()
     except (httpx.HTTPError, ValueError):
         return g.error(502, "payments_unavailable", "We can't reach the payment service right now. Your payment is safe.")
-    if inv.get("status") == "complete":
-        credit(g.conn(), order_id)
+    if inv.get("status") == "complete" and credit(g.conn(), order_id) and alerts:
+        alerts.sale(get_order(g.conn(), order_id), inv)   # the owner's notice: never delays or touches the payment
     o = get_order(g.conn(), order_id)
     return view(inv, o, done=bool(o["done"]))
 
