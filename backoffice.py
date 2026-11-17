@@ -558,7 +558,8 @@ async def overview(door: str, request: Request):
     monthly = stats.monthly(stats.hour_of(now - stats.KEEP_DAYS * DAY))
     return {"generated": g.iso(now),
             "settings": {"gpu_hourly": GPU_HOURLY or None, "speed_bar": stats.SPEED_BAR,
-                         "prices": {p: c / 100 for p, c in checkout.PRICES.items()}},
+                         "prices": {p: c / 100 for p, c in checkout.PRICES.items()},
+                         "at_once": {"max": g.AT_ONCE["max"], "other": g.AT_ONCE[None], "wait_seconds": g.QUEUE_WAIT}},
             "health": {"model": await g.reachable(g.UPSTREAMS[names[0]]) if names else False,
                        "bitcart": sales is not None, "gpu_bill": bill.get("ok") if bill["connected"] else None},
             "summary": totals,

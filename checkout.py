@@ -67,6 +67,8 @@ def view(inv, order, done=False):
                         "chain": chain, "symbol": symbol, "amount": p.get("amount"),
                         "address": p.get("payment_address"), "uri": p.get("payment_url"), "token": token,
                         "sender": p.get("user_address")})  # TRON/BNB: Bitcart only credits payments FROM this address
+    methods.sort(key=lambda m: m["chain"] == "trx")  # TRON last (the page opens on the first): sending on it costs
+    # the customer about $1 to $3 in network fees, the other networks cents.
     return {"status": shown, "underpaid": inv.get("exception_status") == "paid_partial",
             "time_left": inv.get("time_left"), "price_usd": order["cents"] / 100,
             "kind": order["kind"], "plan": order["plan"], "methods": [] if done else methods}

@@ -19,8 +19,10 @@ MIN_FOR_SPEED = 20      # replies shorter than this give no fair speed reading
 STALE = 900             # a reply open longer than the gateway's read timeout is gone, whatever happened to it
 COUNTS = ("requests", "prompt_tokens", "completion_tokens", "gen_tokens", "gen_ms", "timed", "wait_ms", "waited", "slow",
           "cut", "failed", "limit_5h", "limit_week", "expired", "empty", "searches", "fetches", "upstream_micros",
-          "offline", "cached_tokens")  # offline: someone asked while the model server wasn't reachable (counted in
-# failed too); cached_tokens: the part of prompt_tokens the model re-read from its cache (zero for hours before it)
+          "offline", "cached_tokens", "queued", "busy")  # offline: someone asked while the model server wasn't
+# reachable (counted in failed too); cached_tokens: the part of prompt_tokens the model re-read from its cache (zero
+# for hours before it); queued: waited in line because that key already had its full number of replies running (the
+# gateway's AT_ONCE); busy: refused for that reason (the line was full, or the wait passed the gateway's QUEUE_WAIT)
 REFUSAL = {"five_hour": "limit_5h", "weekly": "limit_week", "expired": "expired", "balance": "empty"}
 
 _db = None
@@ -83,10 +85,10 @@ def start(key_hash, now=None):
         except sqlite3.Error:
             pass
     _keys.add(key_hash)
-    for t in [t for t, began in _open.items() if began < now - STALE]:  # self-heal a reply that never reported back
+    for t in [t for t, (began, _) in _open.items() if began < now - STALE]:  # self-heal a reply that never reported back
         del _open[t]
     _next += 1
-    _open[_next] = now
+    _open[_next] = (now, key_hash)
     try:
         db().execute("INSERT INTO load (hour, at_once, keys) VALUES (?, ?, ?) ON CONFLICT(hour) DO UPDATE SET"
                      " at_once = max(at_once, excluded.at_once), keys = max(keys, excluded.keys)",
@@ -98,6 +100,12 @@ def start(key_hash, now=None):
 
 def end(ticket):
     _open.pop(ticket, None)
+
+
+def at_once(key_hash, now=None):
+    """How many replies this key has running right now. One that never reported back stops counting after STALE."""
+    fresh = (time.time() if now is None else now) - STALE
+    return sum(1 for began, k in _open.values() if k == key_hash and began >= fresh)
 
 
 def finish(plan, src, prompt, completion, waited=None, writing=None, cut=False, now=None, cached=0):

@@ -35,6 +35,10 @@ UPSTREAMS = json.loads(os.environ.get("REDBEARD_UPSTREAMS", '{"sherlock": "http:
 UPSTREAM_KEY = os.environ.get("REDBEARD_UPSTREAM_KEY", "")
 MAX_BODY = 32 * 1024 * 1024
 PER_KEY_PER_MINUTE = 120  # an agent can send a request every couple of seconds; this only stops floods
+AT_ONCE = {"max": 6, None: 5}  # replies one key may have running together, by plan (None: every other plan), so
+# one key cannot slow everyone else's replies. A request over the number waits in line for a place; it is refused
+# only when as many again are already waiting, or after QUEUE_WAIT seconds.
+QUEUE_WAIT = 60
 PLAN_INFO = {"starter": ("Starter", 1), "power": ("Power", 3), "max": ("Max", 10), "payg": ("Pay as you go", None)}
 # A hidden system note so the model answers about itself with its own product name. Framed as a POSITIVE identity,
 # never as "do not reveal X": the old "never hint at what you are built on ... private implementation details" phrasing
@@ -51,6 +55,7 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)  # no extra pages
 app.state.conn = None
 app.state.client = None
 hits = defaultdict(deque)  # rate limits: timestamps of the last minute, in memory only
+waiting = defaultdict(int)  # per key: requests waiting in line for a place (see AT_ONCE), in memory only
 
 
 def conn():
@@ -233,9 +238,14 @@ def seed(name):
             {"role": "assistant", "content": f"I'm {name}, an AI assistant made by RedBeard."}]
 
 
-def add_note(payload):
+def add_note(payload, seeded=True):
     """Put NOTE first: inside the app's own opening system message if there is one (some models reject a second
-    system message), otherwise as a new one. Then insert the seed exchange after the leading system message(s)."""
+    system message), otherwise as a new one. Then insert the seed exchange after the leading system message(s).
+
+    seeded=False (the website chat) leaves the seed exchange out: there the model sometimes took the seed for
+    something the customer had really said ("the previous turn was Who are you?"). Every other client keeps it:
+    an agent with tools and long instructions of its own answered its first message more directly with the seed
+    than without. Both measured side by side before the change, as was a shorter NOTE, which held the name less well."""
     msgs = payload.get("messages")
     if not isinstance(msgs, list):
         return  # the kitchen refuses it anyway
@@ -248,6 +258,8 @@ def add_note(payload):
         first["content"] = [{"type": "text", "text": note + "\n\n"}] + first["content"]
     else:
         msgs.insert(0, {"role": "system", "content": note})
+    if not seeded:
+        return
     i = 0
     while i < len(msgs) and isinstance(msgs[i], dict) and msgs[i].get("role") == "system":
         i += 1
@@ -537,7 +549,7 @@ async def chat(request: Request):
     base = UPSTREAMS.get(payload.get("model"))
     if not base:
         return error(404, "model_not_found", f"Unknown model. Available: {', '.join(UPSTREAMS)}.")
-    add_note(payload)
+    add_note(payload, seeded=src != "chat")  # a browser (the website chat) gets the note without the seed exchange
     model = payload["model"]
     url = base.rstrip("/") + "/v1/chat/completions"
     headers = upstream_headers()
@@ -548,8 +560,31 @@ async def chat(request: Request):
             # vLLM reports exact image-inclusive usage on each chunk, including interrupted replies.
             payload["stream_options"]["continuous_usage_stats"] = True
 
-    began = time.monotonic()
-    ticket = stats.start(k.key_hash)
+    began = time.monotonic()  # before the line: the owner's "wait for the first word" includes time spent waiting
+    limit = AT_ONCE.get(k.plan, AT_ONCE[None])
+    if stats.at_once(k.key_hash) >= limit:
+        gone = waiting[k.key_hash] >= limit  # the line is full too
+        if not gone:
+            stats.add(k.plan, src, queued=1)
+            waiting[k.key_hash] += 1
+            try:
+                # ponytail: a 0.1 s poll, so the line is not strictly first-come; an asyncio.Condition if order matters
+                while not gone and stats.at_once(k.key_hash) >= limit:
+                    if await request.is_disconnected():
+                        return Response(status_code=499)  # the customer left the line; nobody is there to read this
+                    gone = time.monotonic() - began > QUEUE_WAIT
+                    await asyncio.sleep(0.1)
+            finally:
+                waiting[k.key_hash] -= 1
+                if not waiting[k.key_hash]:
+                    del waiting[k.key_hash]
+        if gone:
+            stats.add(k.plan, src, busy=1)
+            busy = error(429, "too_many_at_once", f"This key already has {limit} replies running and more waiting. "
+                         "Wait for one to finish, then try again.")
+            busy.headers["Retry-After"] = "5"
+            return busy
+    ticket = stats.start(k.key_hash)  # no await between the last at_once() check and here: a burst can't slip past
     try:
         upstream = await client().send(client().build_request("POST", url, json=payload, headers=headers),
                                        stream=True)
@@ -557,7 +592,7 @@ async def chat(request: Request):
         stats.end(ticket)
         stats.add(k.plan, src, failed=1, offline=1)
         return error(502, "model_unreachable", f"We're updating {model.title()} right now. "
-                     "Check the status page to see when it's back: https://redbeard.sbs/status/")
+                     "Check the status page to see when it's back: https://redbeard.live/status/")
 
     if not streaming or upstream.status_code != 200:
         try:
@@ -619,6 +654,42 @@ async def chat(request: Request):
 
     return StreamingResponse(relay(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# Website support: a customer at checkout can send a message from the site itself, and it reaches the owner's
+# Telegram (the same @redbeard_support_bot as the Telegram option). We keep no copy; the message only passes through
+# on its way there. One-way: the customer leaves a Telegram/Session handle if they want a reply, otherwise the
+# owner fixes it from the order reference. Rate-limited per IP so it can't be used to flood.
+SUPPORT_TOKEN = os.environ.get("REDBEARD_SUPPORT_TOKEN", "")
+SUPPORT_OWNER = os.environ.get("REDBEARD_SUPPORT_OWNER", "")
+
+
+@app.post("/v1/support")
+async def support(request: Request):
+    if too_many("support", client_ip(request), 3):
+        return error(429, "rate_limited", "Too many messages. Wait a minute, then try again.")
+    try:
+        body = await request.json()
+    except (ValueError, AttributeError):
+        return error(400, "bad_request", "Send your message as JSON.")
+    message = str(body.get("message") or "").strip()[:2000]
+    if len(message) < 2:
+        return error(400, "empty_message", "Write your message first.")
+    ref = str(body.get("reference") or "").strip()[:64]
+    kid = str(body.get("key_id") or "").strip()[:16]
+    reply_to = str(body.get("reply_to") or "").strip()[:120]
+    if not (SUPPORT_TOKEN and SUPPORT_OWNER):
+        return error(503, "unavailable", "Messaging from the site is off right now. Please use Telegram.")
+    text = ("\U0001F310 Website support\n"
+            f"order: {ref or '-'}\nKey ID: {kid or '-'}\n"
+            f"reply to: {reply_to or 'none left - fix from the order'}\n\n{message}")
+    try:
+        r = await client().post(f"https://api.telegram.org/bot{SUPPORT_TOKEN}/sendMessage", timeout=15,
+                                json={"chat_id": SUPPORT_OWNER, "text": text, "disable_web_page_preview": True})
+        ok = r.status_code == 200 and r.json().get("ok")
+    except Exception:
+        ok = False
+    return {"ok": True} if ok else error(502, "send_failed", "Could not send just now. Please try Telegram, or try again.")
 
 
 import checkout  # noqa: E402  (crypto checkout; it uses the helpers above)

@@ -150,6 +150,7 @@ async def fake_kitchen(request: Request):
     body = await request.json()
     seen.append(body)
     if not body.get("stream"):
+        await asyncio.sleep(kitchen_mode["slow"])
         return {"choices": [{"message": {"content": "Hello"}}],  # 60 of the 80 read were in the model's cache
                 "usage": {"prompt_tokens": 80, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 60}}}
 
@@ -170,6 +171,7 @@ def fresh_gateway():
     gateway.app.state.conn = store.connect(":memory:")
     gateway.UPSTREAMS = {"sherlock": "http://kitchen"}
     gateway.hits.clear()
+    gateway.waiting.clear()
     seen.clear()
     kitchen_mode.update(usage=True, slow=0.0)
     stats._db = stats.connect(":memory:")
@@ -301,7 +303,7 @@ async def run_e2e():
         gateway.UPSTREAMS = {"sherlock": "http://127.0.0.1:9"}
         r = await gw.post("/v1/chat/completions", json=ask, headers={"Authorization": f"Bearer {raw6}"})
         assert r.status_code == 502 and r.json()["error"]["code"] == "model_unreachable"
-        assert r.json()["error"]["message"].startswith("We're updating Sherlock") and "redbeard.sbs/status/" in r.json()["error"]["message"]
+        assert r.json()["error"]["message"].startswith("We're updating Sherlock") and "redbeard.live/status/" in r.json()["error"]["message"]
 
     tables = [t for (t,) in gateway.app.state.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
     assert tables == ["keys", "orders", "manual_sales"]                                # nothing else is kept
@@ -310,6 +312,39 @@ async def run_e2e():
 
 def test_end_to_end():
     asyncio.run(run_e2e())
+
+
+def test_checkout_lists_tron_last():
+    """The checkout page opens on the first network listed: TRON, the dear one to send on, goes last, the others
+    keep the payment processor's order. An invoice with no TRON, or only TRON, is left as it is."""
+    import checkout
+    pay = lambda chain: {"payment_address": "a-" + chain, "currency": chain, "symbol": "usdt", "contract": "c"}
+    order = {"cents": 500, "kind": "topup", "plan": None}
+    chains = lambda given: [m["chain"] for m in checkout.view({"status": "new", "payments": [pay(c) for c in given]}, order)["methods"]]
+    assert chains(["trx", "bnb", "matic", "eth"]) == ["bnb", "matic", "eth", "trx"]
+    assert chains(["bnb", "trx", "eth"]) == ["bnb", "eth", "trx"]
+    assert chains(["matic", "eth"]) == ["matic", "eth"] and chains(["trx"]) == ["trx"] and chains([]) == []
+
+
+def test_note_without_seed():
+    """The website chat's requests get the identity note and no seed exchange; every other client keeps both.
+    With or without instructions of the client's own, the real message stays last and untouched."""
+    note = gateway.NOTE.format(name="Sherlock")
+    for own in (None, "You are the chat."):
+        for seeded in (True, False):
+            msgs = ([{"role": "system", "content": own}] if own else []) + [{"role": "user", "content": "hi"}]
+            payload = {"model": "sherlock", "messages": msgs}
+            gateway.add_note(payload, seeded=seeded)
+            sent = payload["messages"]
+            assert [m["role"] for m in sent] == (["system", "user", "assistant", "user"] if seeded else ["system", "user"])
+            assert sent[0]["content"] == (note + "\n\n" + own if own else note)
+            assert sent[-1] == {"role": "user", "content": "hi"}
+    payload = {"model": "sherlock", "messages": "junk"}                # the kitchen refuses it; nothing to add to
+    gateway.add_note(payload, seeded=False)
+    assert payload["messages"] == "junk"
+    payload = {"model": "sherlock", "messages": []}
+    gateway.add_note(payload, seeded=False)
+    assert [m["role"] for m in payload["messages"]] == ["system"]
 
 
 def test_stats():
@@ -326,10 +361,12 @@ def test_stats():
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://gw") as gw:
                 raw, h = add_key("power")
                 auth = {"Authorization": f"Bearer {raw}"}
-                browser = {**auth, "Origin": "https://redbeard.sbs"}
+                browser = {**auth, "Origin": "https://redbeard.live"}
                 ask = {"model": "sherlock", "messages": [{"role": "user", "content": "secret words"}]}
                 assert (await gw.post("/v1/chat/completions", json=ask, headers=auth)).status_code == 200
                 assert (await gw.post("/v1/chat/completions", json={**ask, "stream": True}, headers=browser)).status_code == 200
+                sent = seen[-1]["messages"]                          # a browser: the note, and no seed exchange
+                assert [x["role"] for x in sent] == ["system", "user"] and sent[0]["content"] == gateway.NOTE.format(name="Sherlock")
                 assert (await gw.get("/v1/web_search?q=secret", headers=browser)).status_code == 200
                 k = used(h); k.fh_used = meter.PLANS["power"]["five_hour"]; store.put(gateway.app.state.conn, k)
                 assert (await gw.post("/v1/chat/completions", json=ask, headers=auth)).status_code == 429
@@ -464,7 +501,112 @@ def test_hang_up_mid_reply():
                 break
             time.sleep(0.05)
         assert 0 < used(h).fh_used < 100                             # an estimate; the full reply would be 1010
+        assert stats.at_once(h) == 0                                 # and the place it held is free again
     finally:
+        for s in servers:
+            s.should_exit = True
+
+
+def test_at_once_cap():
+    """One key may have 5 replies running together, a Max key 6. A request over the number waits in line and then
+    runs; it is refused only when the line is as long again, or after QUEUE_WAIT. A burst that arrives in the same
+    instant cannot slip past, other keys are untouched, a refused request never reaches the model, and a reply that
+    finished, failed or never reported back does not hold its place."""
+    async def run():
+        fresh_gateway()
+        kitchen_mode["slow"] = 0.01                                            # a streamed reply lasts about 0.4 s
+        gateway.app.state.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=kitchen))
+        n, big = gateway.AT_ONCE[None], gateway.AT_ONCE["max"]
+        assert (n, big) == (5, 6)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://gw") as gw:
+            raw, h = add_key("power")
+            other, _ = add_key()
+            top, _ = add_key("max")
+
+            def count(name):
+                return sum(r[name] for r in stats.rows(0)[0])
+
+            def ask(key, stream):
+                return gw.post("/v1/chat/completions", headers={"Authorization": f"Bearer {key}"},
+                               json={"model": "sherlock", "messages": [{"role": "user", "content": "hi"}], "stream": stream})
+
+            async def burst(key, size, stream=True):
+                replies = await asyncio.gather(*[ask(key, stream) for _ in range(size)])
+                return sorted(r.status_code for r in replies), [r for r in replies if r.status_code == 429]
+
+            for stream in (True, False):                                       # 3 over the number: they wait, then run
+                replies = await asyncio.gather(*[ask(raw, stream) for _ in range(n + 3)], ask(other, stream))
+                assert [r.status_code for r in replies] == [200] * (n + 4)     # the other key's request among them
+                assert all("Hel" in r.text for r in replies)
+                assert stats.at_once(h) == 0 and not gateway.waiting           # every place and the line are free again
+            assert len(seen) == 2 * (n + 4) and (count("queued"), count("busy")) == (6, 0)
+
+            codes, no = await burst(raw, 2 * n + 3)                            # n run, n wait, the line is full for 3
+            assert codes == [200] * (2 * n) + [429] * 3, codes
+            assert no[0].json()["error"]["code"] == "too_many_at_once" and no[0].headers["retry-after"] == "5"
+            assert f"has {n} replies" in no[0].json()["error"]["message"]
+            assert len(seen) == 2 * (n + 4) + 2 * n and count("busy") == 3     # the 3 refused never reached the model
+
+            gateway.QUEUE_WAIT = 0.05                                          # shorter than a reply: the wait runs out
+            codes, _ = await burst(raw, n + 2)
+            assert codes == [200] * n + [429] * 2 and count("busy") == 5, codes
+            codes, no = await burst(top, big + 2)                              # a Max key: 6 together
+            assert codes == [200] * big + [429] * 2, codes
+            assert f"has {big} replies" in no[0].json()["error"]["message"]
+            assert stats.at_once(h) == 0 and not gateway.waiting
+            gateway.QUEUE_WAIT = 60
+
+            for _ in range(n):                                                 # replies that never reported back...
+                stats.start(h, now=time.time() - 2 * stats.STALE)
+            assert stats.at_once(h) == 0 and (await ask(raw, False)).status_code == 200   # ...do not lock the key out
+
+            def down(request):
+                raise httpx.ConnectError("no box")
+            gateway.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(down))
+            codes = [r.status_code for r in await asyncio.gather(*[ask(raw, True) for _ in range(n + 3)])]
+            assert codes == [502] * (n + 3) and stats.at_once(h) == 0          # model unreachable: no place is kept
+    try:
+        asyncio.run(run())
+    finally:
+        gateway.app.state.client = None
+        gateway.QUEUE_WAIT = 60
+
+
+def test_leaves_the_line():
+    """Real sockets: a customer who hangs up while waiting in line gives the place in line back, and the request
+    never reaches the model."""
+    fresh_gateway()
+    kitchen_mode["slow"] = 0.05                                      # one streamed reply lasts about 2 s
+    gateway.app.state.client = None
+    gateway.UPSTREAMS = {"sherlock": "http://127.0.0.1:18954"}
+    gateway.AT_ONCE[None] = 1
+    servers = [serve(kitchen, 18954), serve(gateway.app, 18953)]
+    try:
+        raw, h = add_key()
+        post = dict(url="http://127.0.0.1:18953/v1/chat/completions", headers={"Authorization": f"Bearer {raw}"},
+                    json={"model": "sherlock", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+        got = []
+        first = threading.Thread(target=lambda: got.append(httpx.post(**post, timeout=20).status_code))
+        first.start()
+        for _ in range(100):                                         # until the first reply holds the only place
+            if stats.at_once(h):
+                break
+            time.sleep(0.02)
+        assert stats.at_once(h) == 1
+        try:
+            httpx.post(**post, timeout=0.5)                          # waits in line; gives up after half a second
+            raise AssertionError("the second request should have been waiting in line")
+        except httpx.TimeoutException:
+            pass
+        for _ in range(40):                                          # the gateway notices within its next looks
+            if not gateway.waiting:
+                break
+            time.sleep(0.05)
+        assert not gateway.waiting                                   # the place in line is given back
+        first.join()
+        assert got == [200] and len(seen) == 1 and stats.at_once(h) == 0   # only the first ever reached the model
+    finally:
+        gateway.AT_ONCE[None] = 5
         for s in servers:
             s.should_exit = True
 
@@ -848,6 +990,9 @@ def test_backoffice():
             assert {k["status"] for k in o["keys"]} == {"active", "ended", "revoked"} and len(o["keys"]) == 6
             assert any(k["fp"] == h_ok for k in o["keys"])
             assert {(x["plan"], x["source"]) for x in o["hourly"]} == {("power", "api"), ("max", "chat")}
+            assert all("queued" in x and "busy" in x for x in o["hourly"])          # waits and refusals reach the page
+            assert o["settings"]["at_once"] == {"max": gateway.AT_ONCE["max"], "other": gateway.AT_ONCE[None],
+                                                "wait_seconds": gateway.QUEUE_WAIT}
             assert o["health"]["bitcart"] is True
 
             from collections import Counter                                              # the books

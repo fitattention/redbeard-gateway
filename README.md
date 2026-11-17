@@ -3,8 +3,8 @@
 The gateway behind RedBeard: a small, auditable proxy that sits in front of OpenAI-compatible model servers. It is
 open so anyone can verify the one promise that matters most: **it never stores your conversations.**
 
-RedBeard itself is at [redbeard.sbs](https://redbeard.sbs/): the [docs](https://redbeard.sbs/docs/), and a plain
-summary for AI agents at [redbeard.sbs/llms.txt](https://redbeard.sbs/llms.txt).
+RedBeard itself is at [redbeard.live](https://redbeard.live/): the [docs](https://redbeard.live/docs/), and a plain
+summary for AI agents at [redbeard.live/llms.txt](https://redbeard.live/llms.txt).
 
 ## What it does
 
